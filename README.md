@@ -33,6 +33,33 @@ This installs `/recipe` and `/recipe-scan` as global Claude Code slash commands 
 | `/recipe-scan 7` | Scan last N days |
 | `/recipe-scan all` | Scan all sessions |
 
+## Automatic scanning (session-end hook)
+
+By default, recipe scanning is manual. To automatically scan for recipe-worthy sessions every time a Claude Code session ends, add a `SessionEnd` hook to your global settings (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/commands/recipe-scan.py --days 1 --min-score 30 --limit 5 >> ~/.claude/recipe-scan.log 2>&1",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This logs candidates to `~/.claude/recipe-scan.log` after each session. Review the log periodically and `/recipe save` the sessions worth keeping.
+
+You can adjust `--min-score` (0-100, default 30) and `--days` to tune sensitivity.
+
 ## How it works
 
 - Recipes are stored in `~/.claude/recall.db` (SQLite with FTS5 full-text search)
