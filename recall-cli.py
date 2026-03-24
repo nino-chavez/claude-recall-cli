@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recipe CLI — save and search reusable session recipes.
+"""Recall CLI — save and search reusable session entries.
 
 Storage: ~/.claude/recall.db (SQLite + FTS5)
 Schema is QuantifAI-compatible via session_id foreign key.
@@ -84,7 +84,7 @@ def _migrate(db: sqlite3.Connection):
 
 
 def cmd_save(args):
-    """Save a recipe to the database."""
+    """Save an entry to the database."""
     db = get_db()
     recipe_id = str(uuid.uuid4())[:8]
 
@@ -131,7 +131,7 @@ def cmd_save(args):
 
 
 def cmd_find(args):
-    """Search recipes by keyword using FTS5."""
+    """Search entries by keyword using FTS5."""
     db = get_db()
     # Quote each term for FTS5 safety (hyphens, special chars)
     terms = args.query.split()
@@ -171,7 +171,7 @@ def cmd_find(args):
 
 
 def cmd_list(args):
-    """List recent recipes."""
+    """List recent entries."""
     db = get_db()
     limit = getattr(args, "limit", 20)
 
@@ -200,7 +200,7 @@ def cmd_list(args):
 
 
 def cmd_show(args):
-    """Show full recipe details."""
+    """Show full entry details."""
     db = get_db()
 
     row = db.execute(
@@ -209,7 +209,7 @@ def cmd_show(args):
     ).fetchone()
 
     if not row:
-        print(json.dumps({"error": f"Recipe '{args.id}' not found"}))
+        print(json.dumps({"error": f"Entry '{args.id}' not found"}))
         sys.exit(1)
 
     recipe = dict(row)
@@ -226,7 +226,7 @@ def cmd_show(args):
 
 
 def cmd_use(args):
-    """Output a recipe's prompt template ready to paste, with variable hints."""
+    """Output an entry's prompt template ready to paste, with variable hints."""
     db = get_db()
 
     row = db.execute(
@@ -236,7 +236,7 @@ def cmd_use(args):
     ).fetchone()
 
     if not row:
-        print(json.dumps({"error": f"Recipe '{args.id}' not found"}))
+        print(json.dumps({"error": f"Entry '{args.id}' not found"}))
         sys.exit(1)
 
     recipe = dict(row)
@@ -269,7 +269,7 @@ def cmd_use(args):
 
 
 def cmd_stats(args):
-    """Show recipe library statistics."""
+    """Show recall library statistics."""
     db = get_db()
 
     total = db.execute("SELECT COUNT(*) FROM recipes").fetchone()[0]
@@ -379,7 +379,7 @@ def _extract_session_cost(session_file: Path) -> tuple:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Recipe CLI")
+    parser = argparse.ArgumentParser(description="Recall CLI")
     sub = parser.add_subparsers(dest="command")
 
     # save

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch scan Claude Code sessions for recipe-worthy patterns.
+"""Batch scan Claude Code sessions for recall-worthy patterns.
 
 Analyzes session transcripts and identifies candidates based on:
 - Session efficiency (tokens per tool call)
@@ -30,7 +30,7 @@ NOISE_PREFIXES = [
 
 
 def get_existing_session_ids() -> set:
-    """Get session IDs already saved as recipes."""
+    """Get session IDs already saved as recall entries."""
     if not RECALL_DB.exists():
         return set()
     db = sqlite3.connect(str(RECALL_DB))
@@ -159,8 +159,8 @@ def analyze_session(session_file: Path) -> dict | None:
     }
 
 
-def score_recipe_worthiness(session: dict) -> tuple[float, str]:
-    """Score how likely a session is to contain a reusable recipe.
+def score_recall_worthiness(session: dict) -> tuple[float, str]:
+    """Score how likely a session is worth saving to recall.
     Returns (score 0-100, reason). Higher differentiation than 0-10."""
     score = 0.0
     reasons = []
@@ -264,7 +264,7 @@ def score_recipe_worthiness(session: dict) -> tuple[float, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scan sessions for recipes")
+    parser = argparse.ArgumentParser(description="Scan sessions for recall candidates")
     parser.add_argument(
         "--days",
         default="30",
@@ -274,7 +274,7 @@ def main():
         "--min-score",
         type=float,
         default=4.0,
-        help="Minimum recipe-worthiness score (0-10)",
+        help="Minimum recall-worthiness score (0-100)",
     )
     parser.add_argument(
         "--limit",
@@ -327,15 +327,15 @@ def main():
                 continue
 
             session["project"] = project_name
-            score, reason = score_recipe_worthiness(session)
-            session["recipe_score"] = score
+            score, reason = score_recall_worthiness(session)
+            session["recall_score"] = score
             session["score_reason"] = reason
 
             if score >= args.min_score:
                 candidates.append(session)
 
     # Sort by score descending
-    candidates.sort(key=lambda s: s["recipe_score"], reverse=True)
+    candidates.sort(key=lambda s: s["recall_score"], reverse=True)
     candidates = candidates[: args.limit]
 
     output = {
@@ -352,7 +352,7 @@ def main():
                 "session_id": c["session_id"],
                 "project": c["project"],
                 "intent": c["first_prompt"][:200],
-                "score": c["recipe_score"],
+                "score": c["recall_score"],
                 "reason": c["score_reason"],
                 "tokens": c["total_tokens"],
                 "tools": c["total_tools"],

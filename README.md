@@ -1,41 +1,41 @@
-# claude-recipe-cli
+# claude-recall-cli
 
-Save and search reusable Claude Code session recipes. Global slash commands backed by SQLite + FTS5.
+Save and search reusable Claude Code session entries. Global slash commands backed by SQLite + FTS5.
 
 ## Install
 
 **One-liner (clone + install):**
 
 ```bash
-git clone https://github.com/nino-chavez/claude-recipe-cli.git ~/.claude/recipe-cli && bash ~/.claude/recipe-cli/install.sh
+git clone https://github.com/nino-chavez/claude-recall-cli.git ~/.claude/recall-cli && bash ~/.claude/recall-cli/install.sh
 ```
 
 **Or via curl:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nino-chavez/claude-recipe-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nino-chavez/claude-recall-cli/main/install.sh | bash
 ```
 
-This installs `/recipe` and `/recipe-scan` as global Claude Code slash commands available in every session.
+This installs `/recall` and `/recall-scan` as global Claude Code slash commands available in every session.
 
 ## Usage
 
 | Command | Description |
 |---------|-------------|
-| `/recipe save` | Extract a recipe from the current session |
-| `/recipe find <query>` | Search saved recipes by keyword |
-| `/recipe list` | Show recent recipes |
-| `/recipe show <id>` | Show full recipe details |
-| `/recipe use <id>` | Get the prompt template ready to use |
-| `/recipe use <id> --var key=value` | Fill in template variables |
-| `/recipe stats` | Library statistics |
-| `/recipe-scan` | Scan recent sessions for recipe-worthy patterns |
-| `/recipe-scan 7` | Scan last N days |
-| `/recipe-scan all` | Scan all sessions |
+| `/recall save` | Extract an entry from the current session |
+| `/recall find <query>` | Search saved entries by keyword |
+| `/recall list` | Show recent entries |
+| `/recall show <id>` | Show full entry details |
+| `/recall use <id>` | Get the prompt template ready to use |
+| `/recall use <id> --var key=value` | Fill in template variables |
+| `/recall stats` | Library statistics |
+| `/recall-scan` | Scan recent sessions for recall-worthy patterns |
+| `/recall-scan 7` | Scan last N days |
+| `/recall-scan all` | Scan all sessions |
 
 ## Automatic scanning (session-end hook)
 
-By default, recipe scanning is manual. To automatically scan for recipe-worthy sessions every time a Claude Code session ends, add a `SessionEnd` hook to your global settings (`~/.claude/settings.json`):
+By default, scanning is manual. To automatically scan for recall-worthy sessions every time a Claude Code session ends, add a `SessionEnd` hook to your global settings (`~/.claude/settings.json`):
 
 ```json
 {
@@ -46,7 +46,7 @@ By default, recipe scanning is manual. To automatically scan for recipe-worthy s
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/commands/recipe-scan.py --days 1 --min-score 30 --limit 5 >> ~/.claude/recipe-scan.log 2>&1",
+            "command": "python3 ~/.claude/commands/recall-scan.py --days 1 --min-score 30 --limit 5 >> ~/.claude/recall-scan.log 2>&1",
             "timeout": 30
           }
         ]
@@ -56,21 +56,21 @@ By default, recipe scanning is manual. To automatically scan for recipe-worthy s
 }
 ```
 
-This logs candidates to `~/.claude/recipe-scan.log` after each session. Review the log periodically and `/recipe save` the sessions worth keeping.
+This logs candidates to `~/.claude/recall-scan.log` after each session. Review the log periodically and `/recall save` the sessions worth keeping.
 
 You can adjust `--min-score` (0-100, default 30) and `--days` to tune sensitivity.
 
 ## How it works
 
-- Recipes are stored in `~/.claude/recall.db` (SQLite with FTS5 full-text search)
-- `/recipe save` analyzes the current session transcript and extracts intent, tools used, outcome, and a reusable prompt template with `{{variable}}` placeholders
-- `/recipe-scan` scores past sessions by efficiency, output, focus, and intent clarity to find sessions worth saving as recipes
+- Entries are stored in `~/.claude/recall.db` (SQLite with FTS5 full-text search)
+- `/recall save` analyzes the current session transcript and extracts intent, tools used, outcome, and a reusable prompt template with `{{variable}}` placeholders
+- `/recall-scan` scores past sessions by efficiency, output, focus, and intent clarity to find sessions worth saving
 - No dependencies beyond Python 3 stdlib + SQLite
 
 ## Update
 
 ```bash
-git -C ~/.claude/recipe-cli pull
+git -C ~/.claude/recall-cli pull
 ```
 
 Symlinks mean updates take effect immediately.
@@ -78,9 +78,9 @@ Symlinks mean updates take effect immediately.
 ## Uninstall
 
 ```bash
-rm ~/.claude/commands/recipe.md ~/.claude/commands/recipe-cli.py
-rm ~/.claude/commands/recipe-scan.md ~/.claude/commands/recipe-scan.py
-rm -rf ~/.claude/recipe-cli
+rm ~/.claude/commands/recall.md ~/.claude/commands/recall-cli.py
+rm ~/.claude/commands/recall-scan.md ~/.claude/commands/recall-scan.py
+rm -rf ~/.claude/recall-cli
 # Optionally remove the database: rm ~/.claude/recall.db
 ```
 
