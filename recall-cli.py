@@ -18,6 +18,12 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".claude" / "recall.db"
 
+# Heuristic version — bump when scoring rules, patterns, or thresholds change.
+# Stored alongside quality reports so scores are comparable only within
+# the same version. This is NOT derived from or comparative to any
+# Anthropic internal evaluation framework.
+HEURISTIC_VERSION = 1
+
 
 def get_db() -> sqlite3.Connection:
     """Get or create the recall database."""
@@ -679,6 +685,7 @@ def _run_analysis(session_file: Path) -> dict:
         grade = "F"
 
     return {
+        "heuristic_version": HEURISTIC_VERSION,
         "overall_score": overall,
         "grade": grade,
         "scores": scores,
@@ -787,6 +794,7 @@ def cmd_quality(args):
 
     output = {
         "summary": {
+            "heuristic_version": HEURISTIC_VERSION,
             "sessions_analyzed": len(sessions),
             "days": args.days,
             "avg_score": avg_score,
