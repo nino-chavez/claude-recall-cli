@@ -1,165 +1,151 @@
 # Recall CLI — Quality Measurement Roadmap
 
-Where this tool is, where it needs to go, and what industry-grade quality measurement requires.
-
-## Current state (v3)
-
-Two layers, honest about their limitations:
-
-- **Compliance** (graded A-F): binary checks against Claude Code's documented system prompt rules. Has ground truth. Legitimate.
-- **Process metrics** (descriptive): session shape, thrash ratio, cost. No ground truth. Useful for spotting outliers, not for judging quality.
-
-**What's missing:** No outcome validation. We measure process but never check if the output was correct or useful.
+Paused 2026-03-24. Resume ~2026-06-24 with 3 months of accumulated session data.
 
 ---
 
-## Phase 1: Outcome correlation (manual)
+## What we built (2026-03-24)
 
-**Goal:** Build a labeled dataset linking process metrics to actual outcomes.
+### Recall library (working, stable)
+- `/recall save|find|list|show|use|stats` — session recipe library with SQLite + FTS5
+- `/recall-scan` — batch scan sessions for recall-worthy patterns
+- Auto-population of analysis metrics on save
 
-**What to build:**
-- `/recall verify <id>` command — mark a saved entry with outcome data:
-  - `outcome_verified` (bool): did the session produce working code?
-  - `had_followup_fix` (bool): was there a subsequent fix session for the same work?
-  - `commits_produced` (int): how many commits resulted?
-  - `user_satisfaction` (1-5): manual rating
-- `/recall correlate` command — once you have 50+ labeled entries, compute correlation between process metrics and outcomes. Which process metrics actually predict good outcomes?
+### Quality analysis (working, honest about limitations)
+- `/recall analyze` — single-session compliance grade + process metrics
+- `/recall quality` — trends across recent sessions
+- `/recall verify` — manual outcome labeling (satisfaction, pass/fail, followup)
+- `/recall backfill` — retroactive analysis on older entries
+- Two-layer architecture: compliance (graded, from baseline.json) vs process (descriptive, from thresholds.json)
 
-**Why this matters:** Without this, we can't know if improving compliance scores improves actual results. This is the calibration step that every quality framework requires.
-
-**Schema columns already added:** `outcome_verified`, `had_followup_fix` (DB migration v2).
-
-**Effort:** Small. Mostly CLI plumbing + basic statistics.
-
----
-
-## Phase 2: Automated outcome signals
-
-**Goal:** Replace manual verification with observable signals from git and session data.
-
-**Detectable outcomes (no manual input needed):**
-- **Commit production** — did the session end with `git commit`? Detectable from Bash tool calls.
-- **Follow-up fix detection** — did the same project have another session within 2 hours touching the same files? Detectable from session JSONL cross-referencing.
-- **Error-free completion** — did the session end cleanly or with repeated failing commands?
-- **Code churn** — were files from this session edited again in the next session? (High churn = low quality.)
-
-**What to build:**
-- Post-session outcome extractor that runs in the `SessionEnd` hook
-- Cross-session file overlap analysis (detect follow-up fixes automatically)
-- Outcome fields auto-populated on recall entries
-
-**Effort:** Medium. Requires cross-session analysis and hook integration.
+### Automated outcome pipeline (working, most valuable piece)
+- `/recall extract --days N` — batch feature extraction from all sessions
+- Followup-fix auto-detection via cross-session file overlap (4-hour window)
+- Commit auto-detection from Bash tool calls
+- `/recall correlate` — Pearson correlation with p-values, zero dependencies
+- DB: `session_features` table with 349 rows, 24 columns, fully automated
 
 ---
 
-## Phase 3: Calibrated thresholds
+## What we learned (the important part)
 
-**Goal:** Replace arbitrary thresholds with empirically derived ones from your labeled data.
+### Correlation results (n=349, 30 days, heuristic v4)
 
-**Prerequisite:** 100+ sessions with outcome labels from Phases 1-2.
+**Followup fix prediction (sorted by effect size):**
 
-**What to build:**
-- Statistical analysis: for sessions with `outcome_verified=true` vs `false`, what are the actual distributions of thrash ratio, tokens per output, session shape?
-- Derive thresholds from percentiles of known-good sessions (p25, p50, p75)
-- Write calibrated values back to `thresholds.json` with `_calibrated_from` metadata
-- Track threshold drift over time (do thresholds change as you improve?)
+| Metric | r | p | Significant? | New in v4? |
+|--------|---|---|-------------|------------|
+| edit_count | +0.18 | 0.0006 | Yes | |
+| prompt_count | +0.18 | 0.0008 | Yes | |
+| anti_pattern_count | +0.15 | 0.006 | Yes | |
+| focused_thrash | +0.14 | 0.007 | Yes | New |
+| tool_misuses | +0.12 | 0.027 | Yes | |
+| compliance_score | -0.08 | 0.14 | No | |
+| tokens_per_output | +0.07 | 0.17 | No | |
+| process_score | -0.05 | 0.38 | No | |
+| model_switches | -0.04 | 0.45 | No | New, dead |
+| thrash_ratio | +0.03 | 0.60 | No | |
+| duration_min | +0.01 | 0.85 | No | New, dead |
+| late_error_rate | +0.00 | 1.00 | No | New, dead |
 
-**Industry analog:** Statistical Process Control (SPC). You observe the process producing known-good output, measure its natural variation, and set control limits at the boundaries of that variation. Deviations outside those limits are signals, not arbitrary scores.
+**Max r² = 0.03.** Process metrics explain ~3% of followup-fix variance. The rest is task complexity, domain knowledge, code quality (which we can't observe from session structure), and noise.
 
-**Effort:** Medium. Requires enough data and basic stats (percentiles, correlation coefficients).
+### What was wrong
 
----
+1. **Compliance scoring penalized productivity.** Sessions with commits scored 79.2 vs 85.9 for no-commit sessions. More tool calls = more chances to trigger misuse flags. Fixed by normalizing to misuse *rate* (per 100 Bash calls), which reduced the gap from 19 points to 7.
 
-## Phase 4: Predictive quality
+2. **Prompt clarity punished deliberate architecture discussions.** The original metric penalized sessions where coding started late. Fixed by classifying session *shape* (research_then_build, direct_execution, etc.) instead of scoring prompt-to-output latency.
 
-**Goal:** Before a session ends, predict whether it will need a follow-up fix.
+3. **Composite scores (compliance_score, process_score) don't predict anything.** They measure session complexity, not session quality. The individual raw signals (edit_count, focused_thrash, anti_pattern_count) are weak but real predictors; the composites wash them out.
 
-**What to build:**
-- Lightweight classifier trained on your labeled session data
-- Features: current thrash ratio, compliance score, session shape, cost trajectory, error rate
-- Real-time signal: "This session looks like it's heading toward a follow-up fix" (based on pattern similarity to past sessions that required fixes)
-- Implemented as a `SessionEnd` hook that flags at-risk sessions
+4. **Thrash ratio is noise.** r=+0.03, p=0.60. Edits per unique file doesn't predict followup fixes. But `focused_thrash` (max edits to a single file) does (r=+0.14, p=0.007). The signal is in *concentrated* rework, not distributed rework.
 
-**Industry analog:** Predictive quality in manufacturing — sensors detect process drift before the part fails QA. We detect session drift before the code fails in the next session.
+5. **Three of four new exploratory features were dead signals.** Late error rate (JSONL error structure unreliable), duration (wall-clock time irrelevant), model switches (doesn't predict anything). Only focused_thrash carried signal.
 
-**Prerequisite:** 200+ labeled sessions with follow-up fix data.
+6. **The original plan assumed manual labeling.** We designed `/recall verify` for manual outcome labels, estimated 3 weeks to 50 entries. Instead, automated commit detection + followup-fix cross-referencing labeled 349 sessions in seconds with zero manual input.
 
-**Effort:** Large. Requires ML-lite (logistic regression or decision tree — nothing fancy).
+### What's actually valuable
 
----
+In order of utility:
 
-## Phase 5: Comparative benchmarks
-
-**Goal:** Enable cross-user comparison and community baselines.
-
-**What to build:**
-- Anonymous export format for quality data (no prompt content, only metrics)
-- Community baseline: aggregate compliance and process stats from opt-in users
-- "How does my compliance compare to the community average?"
-- Baseline drift tracking: does the community average improve when Claude Code updates?
-
-**Industry analog:** Industry benchmarking (e.g., DORA metrics reports). Individual orgs compare their deployment frequency and change failure rate to industry medians.
-
-**Prerequisite:** Multiple users running recall-cli with outcome labels.
-
-**Effort:** Large. Requires data collection infrastructure and privacy design.
+1. **Followup-fix auto-detection.** Cross-session file overlap analysis. Zero manual input. The most novel and useful thing in the repo.
+2. **The correlation framework.** Proves what works and what doesn't. Prevents scoring theater.
+3. **The recall library itself.** Save/search/reuse session patterns. The original feature, still the daily driver.
+4. **Compliance checker.** Binary rule checks from baseline.json. Legitimate but doesn't predict outcomes.
+5. **Process metrics.** Descriptive telemetry. Useful for outlier detection, not quality judgment.
 
 ---
 
-## What NOT to build
+## What to do when resuming (~June 2026)
 
-- **Prompt content analysis.** Analyzing what users type introduces privacy concerns, requires NLP infrastructure, and the signal-to-noise ratio is terrible. Structural metrics (tool calls, timing, file changes) are more reliable and cheaper.
-- **Real-time intervention.** Pausing Claude mid-session to say "you're thrashing" would be annoying and disruptive. Post-session analysis is the right cadence.
-- **AI-graded quality.** Using one LLM to judge another LLM's output is circular. Outcomes (did the code work?) are the ground truth, not another model's opinion.
+### Immediate (day 1)
+
+1. **Re-extract with 3 months of data:**
+   ```
+   /recall extract --days 90
+   /recall correlate
+   ```
+   With ~1000+ sessions, weak signals may strengthen or disappear. This is the first thing to do.
+
+2. **Update baseline.json** if Claude Code has updated its system prompt (check version with `claude --version`, compare to `_claude_code_version` in baseline.json).
+
+### If correlations strengthen (any r > 0.25 for followup fix)
+
+3. **Build `/recall calibrate`** — derive thresholds from percentiles of known-good sessions (sessions with commits and no followup fix). Write to thresholds.json with `_calibrated_from` metadata.
+
+4. **Try interaction terms:**
+   - `edit_count * focused_thrash` — big session hammering one file
+   - `anti_pattern_count / prompt_count` — anti-pattern density (normalized)
+   - `focused_thrash / unique_files` — concentration of rework
+
+5. **Try the logistic regression** from IMPLEMENTATION.md Level 5. With 1000+ sessions, even weak individual predictors might combine usefully.
+
+### If correlations stay flat (all r < 0.20)
+
+6. **Accept the ceiling.** Process metrics from session JSONL are structurally limited — they can't see code correctness, test results, or domain appropriateness. Document this honestly and focus the tool on what it does well: the recall library and followup-fix detection.
+
+7. **Consider external signals** that might break through:
+   - **Git diff size** — run `git diff --stat` after sessions with commits. Large diffs that get reverted = quality signal.
+   - **CI/CD results** — if a session's commits trigger CI, did CI pass? (Requires project-specific integration.)
+   - **File age** — editing old stable files vs new files. Regressions in stable code are worse.
+
+   These require reading git state, not just session JSONL. They're a fundamentally different data source.
+
+### What NOT to revisit
+
+- **late_error_rate** — JSONL error structure is unreliable. Don't retry without a better error detection method.
+- **duration_min** — wall-clock time is noise. Don't try to make it work.
+- **model_switches** — no signal. Not worth exploring further.
+- **AI-graded quality** — using Claude to judge Claude is circular. Stick to observable outcomes.
+- **Prompt content analysis** — privacy risk, NLP complexity, low signal-to-noise. The structural metrics are already at the ceiling.
+
+---
+
+## Data state at pause
+
+| Table | Rows | Key columns |
+|-------|------|-------------|
+| recipes | 12 | 6 with analysis metrics, 1 manually verified |
+| recipes_fts | 12 | Full-text search index |
+| session_features | 349 | 24 feature columns, auto-labeled outcomes |
+
+- `recall.db` at `~/.claude/recall.db`
+- `baseline.json` pinned to Claude Code 2.1.81
+- `thresholds.json` — arbitrary (not calibrated from data)
+- `HEURISTIC_VERSION = 4`
 
 ---
 
 ## Maturity model
 
-| Level | Name | What you can say | Status |
-|-------|------|------------------|--------|
-| 0 | Vibes | "That session felt productive" | Done |
-| 1 | Compliance | "Claude followed its documented rules at a 79% rate" | Done |
-| 2 | Descriptive | "This session was research-heavy with high token cost" | Done |
-| 3 | Correlated | "Compliance scores don't predict followup fixes. Raw volume metrics do, weakly." | Done |
-| 4 | Calibrated | "Thresholds derived from empirical data, not gut feel" | Next |
-| 5 | Predictive | "This session pattern predicts a follow-up fix" | Blocked on better signal |
-| 6 | Benchmarked | "Your compliance is in the 80th percentile of recall-cli users" | Future |
+| Level | Name | Status | What we can say |
+|-------|------|--------|-----------------|
+| 0 | Vibes | Done | "That felt productive" |
+| 1 | Compliance | Done | "Claude followed rules at 79% rate" |
+| 2 | Descriptive | Done | "Research-then-build session, 2.7 thrash ratio" |
+| 3 | Correlated | **Done** | "Compliance doesn't predict fixes. Focused thrash does, weakly (r=0.14)." |
+| 4 | Calibrated | Blocked | Needs stronger signal or more data |
+| 5 | Predictive | Blocked | r²=0.03 is too low for useful prediction |
+| 6 | Benchmarked | Future | Needs multiple users |
 
----
-
-## What Level 3 actually found (n=349, 2026-03-24)
-
-First real correlation analysis on 349 sessions from 30 days.
-
-### Followup fix prediction (the real quality signal)
-
-| Metric | r | p | Significant? |
-|--------|---|---|-------------|
-| edit_count | +0.19 | 0.0003 | Yes |
-| prompt_count | +0.19 | 0.0004 | Yes |
-| anti_pattern_count | +0.15 | 0.004 | Yes |
-| tool_misuses | +0.13 | 0.016 | Yes |
-| compliance_score | -0.08 | 0.11 | No |
-| process_score | -0.04 | 0.44 | No |
-| thrash_ratio | +0.02 | 0.71 | No |
-
-**Key findings:**
-1. **Compliance score does not predict quality.** p=0.11, not significant. Sessions that follow rules aren't less likely to need fixes.
-2. **Process score is noise.** p=0.44. Session shape, thrash ratio, cost efficiency — none predict outcomes.
-3. **Raw volume predicts problems.** More edits, more prompts, more anti-patterns → more followup fixes. This is basically "bigger sessions have more problems" — not actionable.
-4. **Productive sessions look worse on compliance.** Sessions with commits score 79.2 on compliance vs 85.9 for no-commit sessions. More activity = more opportunities for tool misuse flags.
-
-### What this means
-
-- The composite scores we designed (compliance, process) measure session complexity, not session quality.
-- Followup-fix auto-detection via cross-session file overlap is the most valuable infrastructure we built.
-- Level 4 (calibrated thresholds) should be derived from followup-fix data, not compliance scores.
-- Level 5 (predictive) needs better signal — current features explain ~4% of variance in followup fixes (r~0.19 → r²~0.04). We need either more features or acceptance that session-level process metrics are weak predictors of code quality.
-
-### Possible next signals to explore
-
-- **File count × thrash interaction** — does thrashing on 1 file predict fixes differently than thrashing across 10 files?
-- **Late-session error rate** — errors in the last 20% of tool calls (session went sideways at the end)
-- **Model switching** — did the session switch between Opus/Sonnet mid-stream?
-- **Session duration** — wall-clock time (from timestamps), not just token count
+**The honest conclusion:** Session-level process metrics from JSONL are inherently weak predictors of code quality. The maximum variance explained is ~3%. This may improve with more data (1000+ sessions) or external signals (git diffs, CI results), but it may also be a hard ceiling. The tool's real value is the recall library and the followup-fix detection infrastructure, not the quality scores.
