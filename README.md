@@ -29,6 +29,9 @@ This installs `/recall` and `/recall-scan` as global Claude Code slash commands 
 | `/recall use <id>` | Get the prompt template ready to use |
 | `/recall use <id> --var key=value` | Fill in template variables |
 | `/recall stats` | Library statistics |
+| `/recall analyze` | Analyze a session for quality patterns |
+| `/recall quality` | Quality trends across recent sessions |
+| `/recall quality --days 7` | Quality trends for last N days |
 | `/recall-scan` | Scan recent sessions for recall-worthy patterns |
 | `/recall-scan 7` | Scan last N days |
 | `/recall-scan all` | Scan all sessions |

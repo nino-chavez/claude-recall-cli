@@ -11,6 +11,8 @@ Save the current session as a reusable recall entry, or search past entries.
 - `/recall use <id>` — Get the prompt template ready to paste (with variable hints)
 - `/recall use <id> --var key=value` — Get the prompt with variables filled in
 - `/recall stats` — Show library statistics (counts, tags, cost)
+- `/recall analyze` — Analyze current or specific session for quality
+- `/recall quality` — Quality trends across recent sessions
 
 ## Instructions
 
@@ -95,3 +97,36 @@ python3 ~/.claude/commands/recall-scan.py --days <N|all> --min-score 30 --limit 
 ```
 
 Display candidates ranked by score. For each high-scoring candidate, offer to extract an entry using the `/recall save` workflow.
+
+When the user runs `/recall analyze`:
+
+Analyze the current session or a specific one. To analyze the current session, find the session JSONL file from context. To analyze a specific session:
+
+```bash
+python3 ~/.claude/commands/recall-cli.py analyze --session-id "<session-id>"
+```
+
+Or by file path:
+
+```bash
+python3 ~/.claude/commands/recall-cli.py analyze --file "<path-to-jsonl>"
+```
+
+Display the results as a quality report card with:
+- Overall grade (A-F) and score (0-100)
+- Five category scores: tool selection, planning (thrash), prompt clarity, cost efficiency, anti-patterns
+- Specific issues found (tool misuses, re-edited files, repeated commands, exploration dead-ends)
+- Actionable recommendations based on the weakest categories
+
+When the user runs `/recall quality` (with optional `--days N`):
+
+```bash
+python3 ~/.claude/commands/recall-cli.py quality --days <N|all> --limit 50
+```
+
+Display a trends dashboard with:
+- Average score and grade distribution across sessions
+- Category averages (which dimension is weakest overall)
+- Total cost and tokens across the period
+- Worst 5 sessions (investigate these)
+- Recent 10 sessions with grades
