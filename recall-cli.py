@@ -173,10 +173,31 @@ def _migrate(db: sqlite3.Connection):
                 had_error_exit      INTEGER,
                 outcome_pass        INTEGER DEFAULT NULL,
                 had_followup_fix    INTEGER DEFAULT NULL,
-                file_size_kb        INTEGER
+                file_size_kb        INTEGER,
+                -- v4 features
+                late_error_rate     REAL,
+                duration_min        REAL,
+                model_switches      INTEGER,
+                focused_thrash      INTEGER
             );
         """)
         db.execute("UPDATE schema_version SET version = 4")
+        db.commit()
+        version = 4
+
+    if version < 5:
+        # Add new feature columns (safe if they already exist from v4 CREATE)
+        for col, typ in [
+            ("late_error_rate", "REAL"),
+            ("duration_min", "REAL"),
+            ("model_switches", "INTEGER"),
+            ("focused_thrash", "INTEGER"),
+        ]:
+            try:
+                db.execute(f"ALTER TABLE session_features ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists from v4 CREATE
+        db.execute("UPDATE schema_version SET version = 5")
         db.commit()
 
 
@@ -1203,14 +1224,109 @@ def _extract_session_features(session_file: Path) -> dict | None:
             primary_model = short
             break
 
-    # Detect error exit (last few Bash calls failed)
-    last_bash_results = []
+    had_error = 1 if analysis["anti_patterns"]["issue_count"] > 0 else 0
+
+    # --- NEW FEATURES ---
+
+    # 1. Late-session error rate: errors in the last 20% of tool calls
+    all_tool_calls = []
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        content = ev.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_use":
+                all_tool_calls.append(block)
+            elif block.get("type") == "tool_result":
+                # Check for error in result
+                is_err = block.get("is_error", False)
+                if all_tool_calls:
+                    all_tool_calls[-1]["_had_error"] = is_err
+
+    # Also detect errors from tool_result events at top level
+    tool_results = []
     for ev in events:
         if ev.get("type") == "result":
-            # Tool results don't have a clean structure, check for error signals
+            tool_results.append(ev)
+
+    # Approximate: count Bash calls where the command likely failed
+    # (stderr patterns, non-zero exit, error keywords in tool_result)
+    bash_calls_with_index = []
+    idx = 0
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        content = ev.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_use":
+                if block.get("name") == "Bash":
+                    bash_calls_with_index.append(idx)
+                idx += 1
+
+    # Check tool results for errors
+    error_indices = set()
+    result_idx = 0
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        content = ev.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_result":
+                if block.get("is_error", False):
+                    error_indices.add(result_idx)
+                result_idx += 1
+
+    total_tc = idx if idx > 0 else 1
+    late_cutoff = int(total_tc * 0.8)
+    late_errors = 0
+    late_total = 0
+    for bi in bash_calls_with_index:
+        if bi >= late_cutoff:
+            late_total += 1
+            if bi in error_indices:
+                late_errors += 1
+    late_error_rate = round(late_errors / late_total, 3) if late_total > 0 else 0.0
+
+    # 2. Session duration from timestamps
+    first_ts = None
+    last_ts = None
+    for ev in events:
+        ts = ev.get("timestamp")
+        if ts:
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+    duration_min = None
+    if first_ts and last_ts:
+        try:
+            t1 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            duration_min = round((t2 - t1).total_seconds() / 60, 1)
+        except (ValueError, TypeError):
             pass
-    # Simpler: check if session has repeated failing commands (from anti-patterns)
-    had_error = 1 if analysis["anti_patterns"]["issue_count"] > 0 else 0
+
+    # 3. Model switches: how many times did the model change between turns?
+    model_sequence = []
+    for ev in events:
+        if ev.get("type") == "assistant":
+            m = ev.get("message", {}).get("model", "")
+            if m:
+                model_sequence.append(m)
+    model_switches = 0
+    for i in range(1, len(model_sequence)):
+        if model_sequence[i] != model_sequence[i - 1]:
+            model_switches += 1
+
+    # 4. Focused thrash: max edits to a single file
+    # (high focused_thrash = hammering one file; different signal from thrash_ratio)
+    edit_counts = analysis["thrash_analysis"]["re_edits"]  # {filename: count}
+    focused_thrash = max(edit_counts.values()) if edit_counts else 0
 
     return {
         "session_id": session_file.stem,
@@ -1232,6 +1348,10 @@ def _extract_session_features(session_file: Path) -> dict | None:
         "had_error_exit": had_error,
         "outcome_pass": 1 if commits > 0 else 0,
         "file_size_kb": session_file.stat().st_size // 1024,
+        "late_error_rate": late_error_rate,
+        "duration_min": duration_min,
+        "model_switches": model_switches,
+        "focused_thrash": focused_thrash,
     }
 
 
@@ -1393,8 +1513,9 @@ def cmd_extract(args):
                     process_score, session_shape, thrash_ratio, tokens_per_output,
                     total_tokens, total_cost, tool_misuses, anti_pattern_count,
                     edit_count, unique_files, prompt_count, model_primary,
-                    commits_produced, had_error_exit, outcome_pass, file_size_kb)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    commits_produced, had_error_exit, outcome_pass, file_size_kb,
+                    late_error_rate, duration_min, model_switches, focused_thrash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     features["session_id"], project_name,
                     features["compliance_score"], features["compliance_grade"],
@@ -1406,6 +1527,8 @@ def cmd_extract(args):
                     features["prompt_count"], features["model_primary"],
                     features["commits_produced"], features["had_error_exit"],
                     features["outcome_pass"], features["file_size_kb"],
+                    features["late_error_rate"], features["duration_min"],
+                    features["model_switches"], features["focused_thrash"],
                 ),
             )
             extracted += 1
@@ -1489,7 +1612,8 @@ def cmd_correlate(args):
         """SELECT compliance_score, process_score, thrash_ratio,
                   tokens_per_output, tool_misuses, anti_pattern_count,
                   edit_count, prompt_count, commits_produced,
-                  outcome_pass, had_followup_fix
+                  outcome_pass, had_followup_fix,
+                  late_error_rate, duration_min, model_switches, focused_thrash
            FROM session_features
            WHERE outcome_pass IS NOT NULL"""
     ).fetchall()
@@ -1511,6 +1635,10 @@ def cmd_correlate(args):
         "anti_pattern_count": [],
         "edit_count": [],
         "prompt_count": [],
+        "late_error_rate": [],
+        "duration_min": [],
+        "model_switches": [],
+        "focused_thrash": [],
     }
     outcome_pass = []
     followup_fix = []
