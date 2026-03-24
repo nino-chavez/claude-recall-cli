@@ -1,0 +1,57 @@
+{
+  "_comment": "User-tunable efficiency thresholds. These are subjective — they define YOUR standard for 'good enough', not Anthropic's. Adjust to match your workflow and cost tolerance.",
+
+  "thrash": {
+    "_comment": "How many times the same file can be edited before it signals poor planning.",
+    "ratio_warning": 1.5,
+    "ratio_high": 2.0,
+    "ratio_critical": 3.0,
+    "single_file_max": 5,
+    "penalty_per_tier": {
+      "warning": 10,
+      "high": 20,
+      "critical": 40,
+      "single_file_over_max": 10
+    }
+  },
+
+  "prompt_clarity": {
+    "_comment": "How quickly the session produces output relative to user prompts.",
+    "perfect_prompts": 1,
+    "good_prompts": 2,
+    "ok_prompts": 4,
+    "warmup_ratio_good": 0.15,
+    "warmup_ratio_ok": 0.30,
+    "warmup_ratio_poor": 0.50,
+    "no_output_score": 30
+  },
+
+  "cost_efficiency": {
+    "_comment": "Tokens per productive tool call (Write/Edit/Bash). Heavily model-dependent — Opus sessions will always score lower here.",
+    "excellent": 3000,
+    "good": 8000,
+    "moderate": 20000,
+    "poor": 50000,
+    "no_output_score": 30,
+    "model_costs_per_million": {
+      "claude-opus-4-6": 0.015,
+      "claude-sonnet-4-6": 0.003,
+      "claude-haiku-4-5": 0.0008
+    }
+  },
+
+  "grades": {
+    "A": 85,
+    "B": 70,
+    "C": 55,
+    "D": 40
+  },
+
+  "compliance_penalty_per_misuse": 15,
+
+  "anti_pattern_severity_weights": {
+    "high": 25,
+    "medium": 15,
+    "low": 5
+  }
+}

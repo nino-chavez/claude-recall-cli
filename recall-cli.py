@@ -20,9 +20,41 @@ DB_PATH = Path.home() / ".claude" / "recall.db"
 
 # Heuristic version — bump when scoring rules, patterns, or thresholds change.
 # Stored alongside quality reports so scores are comparable only within
-# the same version. This is NOT derived from or comparative to any
-# Anthropic internal evaluation framework.
-HEURISTIC_VERSION = 1
+# the same version.
+HEURISTIC_VERSION = 2
+
+# Config file locations — co-located with this script
+_SCRIPT_DIR = Path(__file__).resolve().parent
+BASELINE_PATH = _SCRIPT_DIR / "baseline.json"
+THRESHOLDS_PATH = _SCRIPT_DIR / "thresholds.json"
+
+# Cached config (loaded once per invocation)
+_baseline = None
+_thresholds = None
+
+
+def _load_baseline() -> dict:
+    """Load compliance baseline derived from Claude Code system prompt."""
+    global _baseline
+    if _baseline is None:
+        try:
+            with open(BASELINE_PATH) as f:
+                _baseline = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _baseline = {}
+    return _baseline
+
+
+def _load_thresholds() -> dict:
+    """Load user-tunable efficiency thresholds."""
+    global _thresholds
+    if _thresholds is None:
+        try:
+            with open(THRESHOLDS_PATH) as f:
+                _thresholds = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _thresholds = {}
+    return _thresholds
 
 
 def get_db() -> sqlite3.Connection:
@@ -320,20 +352,13 @@ def cmd_stats(args):
 
 # ---------------------------------------------------------------------------
 # Session quality analysis
+#
+# Two layers:
+#   1. COMPLIANCE — did Claude follow its own system prompt rules?
+#      Sourced from baseline.json (derived from Anthropic's published prompt).
+#   2. EFFICIENCY — did it do so within acceptable cost/effort bounds?
+#      Sourced from thresholds.json (user-tunable, subjective).
 # ---------------------------------------------------------------------------
-
-# Bash commands that should have used a dedicated tool
-TOOL_MISUSE_PATTERNS = [
-    (r"\bcat\s+", "Read"),
-    (r"\bhead\s+", "Read"),
-    (r"\btail\s+", "Read"),
-    (r"\bsed\s+", "Edit"),
-    (r"\bawk\s+", "Edit"),
-    (r"\bgrep\s+", "Grep"),
-    (r"\brg\s+", "Grep"),
-    (r"\bfind\s+", "Glob"),
-    (r"\bls\s+.*\*", "Glob"),
-]
 
 
 def _parse_session_events(session_file: Path) -> list[dict]:
@@ -352,18 +377,21 @@ def _parse_session_events(session_file: Path) -> list[dict]:
 
 
 def _analyze_tool_selection(events: list[dict]) -> dict:
-    """Check for Bash commands that should have used dedicated tools."""
+    """COMPLIANCE: Check for Bash commands that should have used dedicated tools.
+    Rules sourced from baseline.json → tool_selection."""
+    baseline = _load_baseline()
+    thresholds = _load_thresholds()
+
+    ts = baseline.get("tool_selection", {})
+    misuse_patterns = [
+        (p["bash_pattern"], p["expected_tool"], p.get("prompt_rule", ""))
+        for p in ts.get("misuse_patterns", [])
+    ]
+    bash_ok = tuple(ts.get("bash_ok_prefixes", []))
+    penalty = thresholds.get("compliance_penalty_per_misuse", 15)
+
     misuses = []
     bash_count = 0
-
-    # Commands that are legitimately Bash-only (no dedicated tool)
-    BASH_OK_PREFIXES = (
-        "git ", "npm ", "npx ", "pnpm ", "yarn ", "pip ", "python",
-        "docker ", "curl ", "wget ", "ssh ", "scp ", "rsync ",
-        "cd ", "mkdir ", "rm ", "mv ", "cp ", "chmod ", "chown ",
-        "brew ", "cargo ", "go ", "make ", "cmake ", "supabase ",
-        "vercel ", "gh ", "node ", "bun ", "deno ",
-    )
 
     for ev in events:
         if ev.get("type") != "assistant":
@@ -377,30 +405,34 @@ def _analyze_tool_selection(events: list[dict]) -> dict:
             bash_count += 1
             cmd = block.get("input", {}).get("command", "").strip()
 
-            # Skip commands that are legitimately Bash-only
-            if any(cmd.startswith(p) for p in BASH_OK_PREFIXES):
+            if any(cmd.startswith(p) for p in bash_ok):
                 continue
 
-            for pattern, better_tool in TOOL_MISUSE_PATTERNS:
+            for pattern, better_tool, rule in misuse_patterns:
                 if re.search(pattern, cmd):
                     misuses.append({
                         "command": cmd[:120],
                         "should_use": better_tool,
+                        "rule": rule,
                     })
                     break
 
     return {
+        "layer": "compliance",
         "bash_calls": bash_count,
         "misuses": misuses,
         "misuse_count": len(misuses),
-        "score": max(0, 100 - (len(misuses) * 15)),  # -15 per misuse
+        "score": max(0, 100 - (len(misuses) * penalty)),
     }
 
 
 def _analyze_thrash(events: list[dict]) -> dict:
-    """Detect re-edits of the same file (planning vs thrashing)."""
-    edit_targets = []
+    """EFFICIENCY: Detect re-edits of the same file (planning vs thrashing).
+    Thresholds sourced from thresholds.json → thrash."""
+    t = _load_thresholds().get("thrash", {})
+    penalties = t.get("penalty_per_tier", {})
 
+    edit_targets = []
     for ev in events:
         if ev.get("type") != "assistant":
             continue
@@ -416,30 +448,29 @@ def _analyze_thrash(events: list[dict]) -> dict:
                     edit_targets.append(fp)
 
     if not edit_targets:
-        return {"edits": 0, "unique_files": 0, "re_edits": {},
-                "thrash_ratio": 0.0, "score": 100}
+        return {"layer": "efficiency", "edits": 0, "unique_files": 0,
+                "re_edits": {}, "thrash_ratio": 0.0, "score": 100}
 
     counts = Counter(edit_targets)
     re_edits = {f: c for f, c in counts.items() if c > 2}
     unique = len(counts)
     total = len(edit_targets)
-    # Thrash ratio: 1.0 = every edit is a unique file, higher = re-editing
     thrash_ratio = round(total / unique, 2) if unique > 0 else 0.0
 
-    # Score: penalize when thrash ratio is high
     score = 100
-    if thrash_ratio > 3.0:
-        score -= 40
-    elif thrash_ratio > 2.0:
-        score -= 20
-    elif thrash_ratio > 1.5:
-        score -= 10
-    # Extra penalty for individual files edited 5+ times
+    if thrash_ratio > t.get("ratio_critical", 3.0):
+        score -= penalties.get("critical", 40)
+    elif thrash_ratio > t.get("ratio_high", 2.0):
+        score -= penalties.get("high", 20)
+    elif thrash_ratio > t.get("ratio_warning", 1.5):
+        score -= penalties.get("warning", 10)
+
     for f, c in re_edits.items():
-        if c >= 5:
-            score -= 10
+        if c >= t.get("single_file_max", 5):
+            score -= penalties.get("single_file_over_max", 10)
 
     return {
+        "layer": "efficiency",
         "edits": total,
         "unique_files": unique,
         "re_edits": {Path(f).name: c for f, c in re_edits.items()},
@@ -449,7 +480,10 @@ def _analyze_thrash(events: list[dict]) -> dict:
 
 
 def _analyze_prompt_clarity(events: list[dict]) -> dict:
-    """Measure how many user messages before first productive output."""
+    """EFFICIENCY: Measure how many user messages before first productive output.
+    Thresholds sourced from thresholds.json → prompt_clarity."""
+    t = _load_thresholds().get("prompt_clarity", {})
+
     user_msgs_before_output = 0
     total_user_msgs = 0
     found_output = False
@@ -469,32 +503,29 @@ def _analyze_prompt_clarity(events: list[dict]) -> dict:
                     found_output = True
                     break
 
-    # Score: fewer prompts before first output = better
-    # But normalize by total prompts — a 50-prompt session where output
-    # starts at prompt 5 is fine (10% warmup), not a clarity failure
     if not found_output:
-        score = 30  # no output at all
-    elif user_msgs_before_output <= 1:
+        score = t.get("no_output_score", 30)
+    elif user_msgs_before_output <= t.get("perfect_prompts", 1):
         score = 100
-    elif user_msgs_before_output <= 2:
+    elif user_msgs_before_output <= t.get("good_prompts", 2):
         score = 90
-    elif user_msgs_before_output <= 4:
+    elif user_msgs_before_output <= t.get("ok_prompts", 4):
         score = 75
     elif total_user_msgs > 0:
-        # Ratio-based: what fraction of session was pre-output?
         warmup_ratio = user_msgs_before_output / total_user_msgs
-        if warmup_ratio < 0.15:
-            score = 70  # small warmup relative to session
-        elif warmup_ratio < 0.30:
+        if warmup_ratio < t.get("warmup_ratio_good", 0.15):
+            score = 70
+        elif warmup_ratio < t.get("warmup_ratio_ok", 0.30):
             score = 55
-        elif warmup_ratio < 0.50:
+        elif warmup_ratio < t.get("warmup_ratio_poor", 0.50):
             score = 40
         else:
-            score = 25  # half the session before any output
+            score = 25
     else:
         score = 20
 
     return {
+        "layer": "efficiency",
         "prompts_before_output": user_msgs_before_output,
         "total_prompts": total_user_msgs,
         "had_output": found_output,
@@ -503,15 +534,17 @@ def _analyze_prompt_clarity(events: list[dict]) -> dict:
 
 
 def _analyze_cost_efficiency(events: list[dict]) -> dict:
-    """Tokens per productive tool call (Write/Edit/Bash)."""
-    total_tokens = 0
-    productive_calls = 0
-
-    MODEL_COSTS = {
+    """EFFICIENCY: Tokens per productive tool call (Write/Edit/Bash).
+    Thresholds sourced from thresholds.json → cost_efficiency."""
+    t = _load_thresholds().get("cost_efficiency", {})
+    model_costs = t.get("model_costs_per_million", {
         "claude-opus-4-6": 0.015,
         "claude-sonnet-4-6": 0.003,
         "claude-haiku-4-5": 0.0008,
-    }
+    })
+
+    total_tokens = 0
+    productive_calls = 0
     total_cost = 0.0
 
     for ev in events:
@@ -529,7 +562,7 @@ def _analyze_cost_efficiency(events: list[dict]) -> dict:
         total_tokens += tokens
 
         rate = 0.003
-        for model_key, model_rate in MODEL_COSTS.items():
+        for model_key, model_rate in model_costs.items():
             if model_key in model:
                 rate = model_rate
                 break
@@ -546,21 +579,21 @@ def _analyze_cost_efficiency(events: list[dict]) -> dict:
         if productive_calls > 0 else None
     )
 
-    # Score based on tokens per productive call
     if tokens_per_output is None:
-        score = 30
-    elif tokens_per_output < 3000:
+        score = t.get("no_output_score", 30)
+    elif tokens_per_output < t.get("excellent", 3000):
         score = 100
-    elif tokens_per_output < 8000:
+    elif tokens_per_output < t.get("good", 8000):
         score = 80
-    elif tokens_per_output < 20000:
+    elif tokens_per_output < t.get("moderate", 20000):
         score = 60
-    elif tokens_per_output < 50000:
+    elif tokens_per_output < t.get("poor", 50000):
         score = 40
     else:
         score = 20
 
     return {
+        "layer": "efficiency",
         "total_tokens": total_tokens,
         "est_cost": round(total_cost, 4),
         "productive_calls": productive_calls,
@@ -570,34 +603,19 @@ def _analyze_cost_efficiency(events: list[dict]) -> dict:
 
 
 def _analyze_antipatterns(events: list[dict]) -> dict:
-    """Detect common waste patterns."""
+    """COMPLIANCE: Detect behavioral anti-patterns defined in system prompt.
+    Rules sourced from baseline.json → anti_patterns."""
+    baseline = _load_baseline()
+    thresholds = _load_thresholds()
+    severity_weights = thresholds.get("anti_pattern_severity_weights",
+                                      {"high": 25, "medium": 15, "low": 5})
+
+    rules = {r["id"]: r for r in baseline.get("anti_patterns", {}).get("rules", [])}
     issues = []
 
-    # 1. Repeated identical Bash commands (retries without fixing)
+    # Extract all tool calls in order
+    tool_calls = []
     bash_cmds = []
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        content = ev.get("message", {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if block.get("type") == "tool_use" and block.get("name") == "Bash":
-                bash_cmds.append(block.get("input", {}).get("command", ""))
-
-    bash_counts = Counter(bash_cmds)
-    repeated = {c[:80]: n for c, n in bash_counts.items() if n >= 3 and c}
-    if repeated:
-        issues.append({
-            "type": "repeated_commands",
-            "detail": f"{len(repeated)} commands run 3+ times",
-            "examples": list(repeated.keys())[:3],
-            "severity": "high",
-        })
-
-    # 2. Long read sequences with no output (exploration dead-end)
-    consecutive_reads = 0
-    max_reads_without_output = 0
     for ev in events:
         if ev.get("type") != "assistant":
             continue
@@ -607,44 +625,88 @@ def _analyze_antipatterns(events: list[dict]) -> dict:
         for block in content:
             if block.get("type") != "tool_use":
                 continue
-            if block.get("name") in ("Read", "Grep", "Glob"):
-                consecutive_reads += 1
-            elif block.get("name") in ("Write", "Edit", "Bash"):
-                max_reads_without_output = max(max_reads_without_output, consecutive_reads)
-                consecutive_reads = 0
+            name = block.get("name", "")
+            inp = block.get("input", {})
+            tool_calls.append({"name": name, "input": inp})
+            if name == "Bash":
+                bash_cmds.append(inp.get("command", ""))
+
+    # 1. Repeated identical Bash commands (no_retry_loops)
+    rule = rules.get("no_retry_loops", {})
+    threshold = rule.get("threshold", 3)
+    bash_counts = Counter(bash_cmds)
+    repeated = {c[:80]: n for c, n in bash_counts.items() if n >= threshold and c}
+    if repeated:
+        issues.append({
+            "type": "repeated_commands",
+            "rule": rule.get("prompt_rule", ""),
+            "detail": f"{len(repeated)} commands run {threshold}+ times",
+            "examples": list(repeated.keys())[:3],
+            "severity": rule.get("severity", "high"),
+        })
+
+    # 2. Long read sequences with no output (no_brute_force)
+    rule = rules.get("no_brute_force", {})
+    threshold = rule.get("threshold", 15)
+    consecutive_reads = 0
+    max_reads_without_output = 0
+    for tc in tool_calls:
+        if tc["name"] in ("Read", "Grep", "Glob"):
+            consecutive_reads += 1
+        elif tc["name"] in ("Write", "Edit", "Bash"):
+            max_reads_without_output = max(max_reads_without_output, consecutive_reads)
+            consecutive_reads = 0
     max_reads_without_output = max(max_reads_without_output, consecutive_reads)
 
-    if max_reads_without_output >= 15:
+    if max_reads_without_output >= threshold:
         issues.append({
             "type": "exploration_dead_end",
+            "rule": rule.get("prompt_rule", ""),
             "detail": f"{max_reads_without_output} consecutive reads without output",
-            "severity": "medium",
+            "severity": rule.get("severity", "medium"),
         })
 
-    # 3. Agent tool spawned excessively
-    agent_count = 0
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        content = ev.get("message", {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if block.get("type") == "tool_use" and block.get("name") == "Agent":
-                agent_count += 1
-    if agent_count >= 8:
+    # 3. Excessive agent spawns (no_excessive_agents)
+    rule = rules.get("no_excessive_agents", {})
+    threshold = rule.get("threshold", 8)
+    agent_count = sum(1 for tc in tool_calls if tc["name"] == "Agent")
+    if agent_count >= threshold:
         issues.append({
             "type": "excessive_agents",
+            "rule": rule.get("prompt_rule", ""),
             "detail": f"{agent_count} sub-agents spawned",
-            "severity": "low",
+            "severity": rule.get("severity", "low"),
         })
 
+    # 4. Edit without prior Read (read_before_edit)
+    rule = rules.get("read_before_edit", {})
+    if rule:
+        files_read = set()
+        edits_without_read = []
+        for tc in tool_calls:
+            if tc["name"] == "Read":
+                fp = tc["input"].get("file_path", "")
+                if fp:
+                    files_read.add(fp)
+            elif tc["name"] == "Edit":
+                fp = tc["input"].get("file_path", "")
+                if fp and fp not in files_read:
+                    edits_without_read.append(Path(fp).name)
+        if edits_without_read:
+            issues.append({
+                "type": "edit_without_read",
+                "rule": rule.get("prompt_rule", ""),
+                "detail": f"{len(edits_without_read)} files edited without reading first",
+                "examples": edits_without_read[:5],
+                "severity": rule.get("severity", "medium"),
+            })
+
     score = 100 - sum(
-        {"high": 25, "medium": 15, "low": 5}.get(i["severity"], 0)
-        for i in issues
+        severity_weights.get(i["severity"], 0) for i in issues
     )
 
     return {
+        "layer": "compliance",
         "issues": issues,
         "issue_count": len(issues),
         "score": max(0, score),
@@ -652,7 +714,12 @@ def _analyze_antipatterns(events: list[dict]) -> dict:
 
 
 def _run_analysis(session_file: Path) -> dict:
-    """Run all analysis passes on a session file."""
+    """Run all analysis passes on a session file.
+
+    Returns scores split into two layers:
+      - compliance: tool_selection, anti_patterns (from baseline.json)
+      - efficiency: planning, prompt_clarity, cost_efficiency (from thresholds.json)
+    """
     events = _parse_session_events(session_file)
     if not events:
         return {"error": "No events found in session file"}
@@ -663,32 +730,41 @@ def _run_analysis(session_file: Path) -> dict:
     cost = _analyze_cost_efficiency(events)
     anti = _analyze_antipatterns(events)
 
-    scores = {
+    compliance_scores = {
         "tool_selection": tool_sel["score"],
+        "anti_patterns": anti["score"],
+    }
+    efficiency_scores = {
         "planning": thrash["score"],
         "prompt_clarity": clarity["score"],
         "cost_efficiency": cost["score"],
-        "anti_patterns": anti["score"],
     }
-    overall = round(sum(scores.values()) / len(scores), 1)
+    all_scores = {**compliance_scores, **efficiency_scores}
+    overall = round(sum(all_scores.values()) / len(all_scores), 1)
+    compliance_avg = round(sum(compliance_scores.values()) / len(compliance_scores), 1)
+    efficiency_avg = round(sum(efficiency_scores.values()) / len(efficiency_scores), 1)
 
-    # Grade
-    if overall >= 85:
+    # Grade from thresholds
+    grades = _load_thresholds().get("grades", {"A": 85, "B": 70, "C": 55, "D": 40})
+    if overall >= grades.get("A", 85):
         grade = "A"
-    elif overall >= 70:
+    elif overall >= grades.get("B", 70):
         grade = "B"
-    elif overall >= 55:
+    elif overall >= grades.get("C", 55):
         grade = "C"
-    elif overall >= 40:
+    elif overall >= grades.get("D", 40):
         grade = "D"
     else:
         grade = "F"
 
     return {
         "heuristic_version": HEURISTIC_VERSION,
+        "baseline_source": "Claude Code system prompt (via baseline.json)",
         "overall_score": overall,
         "grade": grade,
-        "scores": scores,
+        "compliance_score": compliance_avg,
+        "efficiency_score": efficiency_avg,
+        "scores": all_scores,
         "tool_selection": tool_sel,
         "thrash_analysis": thrash,
         "prompt_clarity": clarity,
@@ -756,6 +832,8 @@ def cmd_quality(args):
                 ).strftime("%Y-%m-%d"),
                 "grade": result["grade"],
                 "overall": result["overall_score"],
+                "compliance": result["compliance_score"],
+                "efficiency": result["efficiency_score"],
                 "scores": result["scores"],
                 "tokens": result["cost_efficiency"]["total_tokens"],
                 "cost": result["cost_efficiency"]["est_cost"],
@@ -792,12 +870,23 @@ def cmd_quality(args):
     # Bottom 5 sessions
     worst = sorted(sessions, key=lambda s: s["overall"])[:5]
 
+    # Layer averages
+    avg_compliance = round(
+        sum(s["compliance"] for s in sessions) / len(sessions), 1
+    )
+    avg_efficiency = round(
+        sum(s["efficiency"] for s in sessions) / len(sessions), 1
+    )
+
     output = {
         "summary": {
             "heuristic_version": HEURISTIC_VERSION,
+            "baseline_source": "Claude Code system prompt (via baseline.json)",
             "sessions_analyzed": len(sessions),
             "days": args.days,
             "avg_score": avg_score,
+            "avg_compliance": avg_compliance,
+            "avg_efficiency": avg_efficiency,
             "grade_distribution": dict(grade_dist.most_common()),
             "total_cost": round(total_cost, 4),
             "total_tokens": total_tokens,

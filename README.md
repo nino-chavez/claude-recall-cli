@@ -70,6 +70,35 @@ You can adjust `--min-score` (0-100, default 30) and `--days` to tune sensitivit
 - `/recall-scan` scores past sessions by efficiency, output, focus, and intent clarity to find sessions worth saving
 - No dependencies beyond Python 3 stdlib + SQLite
 
+## Quality analysis
+
+`/recall analyze` and `/recall quality` score sessions across two independent layers:
+
+### Compliance (from `baseline.json`)
+
+Objective checks: did Claude follow its own documented system prompt rules?
+
+- **Tool selection** — Bash calls that should have used Read/Edit/Grep/Glob (rules extracted from Claude Code's system prompt)
+- **Anti-patterns** — Retry loops, exploration dead-ends, edits without prior reads, excessive sub-agents
+
+Rules are sourced from [Claude Code system prompts](https://github.com/Piebald-AI/claude-code-system-prompts). Update `baseline.json` when Claude Code releases new tool guidance.
+
+### Efficiency (from `thresholds.json`)
+
+Subjective checks: did Claude work within acceptable cost/effort bounds?
+
+- **Planning** — File thrash ratio (same file edited repeatedly = poor planning)
+- **Prompt clarity** — Prompts before first productive output
+- **Cost efficiency** — Tokens per productive tool call (model-dependent)
+
+Thresholds are user-tunable. Edit `thresholds.json` to match your workflow.
+
+### Versioning
+
+Every output includes `heuristic_version` (currently v2). Bump `HEURISTIC_VERSION` in `recall-cli.py` when you change scoring rules. Scores from different versions should not be compared.
+
+This analysis is **not derived from or comparative to any Anthropic internal evaluation framework**. It is an independent quality assessment based on observable session behavior.
+
 ## Update
 
 ```bash
