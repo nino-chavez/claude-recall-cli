@@ -116,14 +116,50 @@ Two layers, honest about their limitations:
 
 ## Maturity model
 
-| Level | Name | What you can say | We are here |
-|-------|------|------------------|-------------|
-| 0 | Vibes | "That session felt productive" | |
-| 1 | Compliance | "Claude followed 85% of its documented rules" | <-- |
-| 2 | Descriptive | "This session was research-heavy with high token cost" | <-- |
-| 3 | Correlated | "Sessions with thrash ratio > 3.0 are 2x more likely to need follow-up fixes" | |
-| 4 | Calibrated | "Thresholds derived from 200 labeled sessions, p75 of known-good" | |
-| 5 | Predictive | "This session pattern predicts a follow-up fix with 70% confidence" | |
-| 6 | Benchmarked | "Your compliance is in the 80th percentile of recall-cli users" | |
+| Level | Name | What you can say | Status |
+|-------|------|------------------|--------|
+| 0 | Vibes | "That session felt productive" | Done |
+| 1 | Compliance | "Claude followed its documented rules at a 79% rate" | Done |
+| 2 | Descriptive | "This session was research-heavy with high token cost" | Done |
+| 3 | Correlated | "Compliance scores don't predict followup fixes. Raw volume metrics do, weakly." | Done |
+| 4 | Calibrated | "Thresholds derived from empirical data, not gut feel" | Next |
+| 5 | Predictive | "This session pattern predicts a follow-up fix" | Blocked on better signal |
+| 6 | Benchmarked | "Your compliance is in the 80th percentile of recall-cli users" | Future |
 
-We are at Level 1-2. Phase 1 gets us to Level 3. That's the critical transition — everything before Level 3 is measurement theater dressed up as quality analysis.
+---
+
+## What Level 3 actually found (n=349, 2026-03-24)
+
+First real correlation analysis on 349 sessions from 30 days.
+
+### Followup fix prediction (the real quality signal)
+
+| Metric | r | p | Significant? |
+|--------|---|---|-------------|
+| edit_count | +0.19 | 0.0003 | Yes |
+| prompt_count | +0.19 | 0.0004 | Yes |
+| anti_pattern_count | +0.15 | 0.004 | Yes |
+| tool_misuses | +0.13 | 0.016 | Yes |
+| compliance_score | -0.08 | 0.11 | No |
+| process_score | -0.04 | 0.44 | No |
+| thrash_ratio | +0.02 | 0.71 | No |
+
+**Key findings:**
+1. **Compliance score does not predict quality.** p=0.11, not significant. Sessions that follow rules aren't less likely to need fixes.
+2. **Process score is noise.** p=0.44. Session shape, thrash ratio, cost efficiency — none predict outcomes.
+3. **Raw volume predicts problems.** More edits, more prompts, more anti-patterns → more followup fixes. This is basically "bigger sessions have more problems" — not actionable.
+4. **Productive sessions look worse on compliance.** Sessions with commits score 79.2 on compliance vs 85.9 for no-commit sessions. More activity = more opportunities for tool misuse flags.
+
+### What this means
+
+- The composite scores we designed (compliance, process) measure session complexity, not session quality.
+- Followup-fix auto-detection via cross-session file overlap is the most valuable infrastructure we built.
+- Level 4 (calibrated thresholds) should be derived from followup-fix data, not compliance scores.
+- Level 5 (predictive) needs better signal — current features explain ~4% of variance in followup fixes (r~0.19 → r²~0.04). We need either more features or acceptance that session-level process metrics are weak predictors of code quality.
+
+### Possible next signals to explore
+
+- **File count × thrash interaction** — does thrashing on 1 file predict fixes differently than thrashing across 10 files?
+- **Late-session error rate** — errors in the last 20% of tool calls (session went sideways at the end)
+- **Model switching** — did the session switch between Opus/Sonnet mid-stream?
+- **Session duration** — wall-clock time (from timestamps), not just token count

@@ -21,7 +21,7 @@ DB_PATH = Path.home() / ".claude" / "recall.db"
 # Heuristic version — bump when scoring rules, patterns, or thresholds change.
 # Stored alongside quality reports so scores are comparable only within
 # the same version.
-HEURISTIC_VERSION = 3
+HEURISTIC_VERSION = 4
 
 # Config file locations — co-located with this script
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -509,12 +509,24 @@ def _analyze_tool_selection(events: list[dict]) -> dict:
                     })
                     break
 
+    # Normalize: misuse RATE, not raw count
+    # A 50-bash session with 3 misuses (6%) is better than
+    # a 5-bash session with 3 misuses (60%)
+    eligible_bash = bash_count  # total Bash calls checked
+    misuse_rate = (len(misuses) / eligible_bash * 100) if eligible_bash > 0 else 0.0
+
+    # Score based on rate: 0% = 100, scales down
+    # penalty_per_misuse is repurposed as "penalty per 10% misuse rate"
+    rate_penalty = (misuse_rate / 10) * penalty
+    score = max(0, round(100 - rate_penalty))
+
     return {
         "layer": "compliance",
         "bash_calls": bash_count,
         "misuses": misuses,
         "misuse_count": len(misuses),
-        "score": max(0, 100 - (len(misuses) * penalty)),
+        "misuse_rate_pct": round(misuse_rate, 1),
+        "score": score,
     }
 
 
