@@ -1,5 +1,5 @@
 {
-  "_comment": "User-tunable efficiency thresholds. These are subjective — they define YOUR standard for 'good enough', not Anthropic's. Adjust to match your workflow and cost tolerance.",
+  "_comment": "User-tunable process metric thresholds. These are DESCRIPTIVE, not quality judgments. They describe session behavior affected by task complexity, model choice, and intent. Only compliance (baseline.json) is graded.",
 
   "thrash": {
     "_comment": "How many times the same file can be edited before it signals poor planning.",
@@ -16,7 +16,7 @@
   },
 
   "prompt_clarity": {
-    "_comment": "How quickly the session produces output relative to user prompts.",
+    "_comment": "Session shape classification. Research-then-build sessions are NOT penalized — deliberate exploration is legitimate.",
     "perfect_prompts": 1,
     "good_prompts": 2,
     "ok_prompts": 4,

@@ -21,7 +21,7 @@ DB_PATH = Path.home() / ".claude" / "recall.db"
 # Heuristic version — bump when scoring rules, patterns, or thresholds change.
 # Stored alongside quality reports so scores are comparable only within
 # the same version.
-HEURISTIC_VERSION = 2
+HEURISTIC_VERSION = 3
 
 # Config file locations — co-located with this script
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -120,6 +120,16 @@ def _migrate(db: sqlite3.Connection):
             db.execute("INSERT INTO schema_version (version) VALUES (1)")
         else:
             db.execute("UPDATE schema_version SET version = 1")
+        db.commit()
+        version = 1
+
+    if version < 2:
+        # Add outcome tracking for quality correlation
+        db.executescript("""
+            ALTER TABLE recipes ADD COLUMN outcome_verified INTEGER DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN had_followup_fix INTEGER DEFAULT NULL;
+        """)
+        db.execute("UPDATE schema_version SET version = 2")
         db.commit()
 
 
@@ -448,7 +458,7 @@ def _analyze_thrash(events: list[dict]) -> dict:
                     edit_targets.append(fp)
 
     if not edit_targets:
-        return {"layer": "efficiency", "edits": 0, "unique_files": 0,
+        return {"layer": "process", "edits": 0, "unique_files": 0,
                 "re_edits": {}, "thrash_ratio": 0.0, "score": 100}
 
     counts = Counter(edit_targets)
@@ -470,7 +480,7 @@ def _analyze_thrash(events: list[dict]) -> dict:
             score -= penalties.get("single_file_over_max", 10)
 
     return {
-        "layer": "efficiency",
+        "layer": "process",
         "edits": total,
         "unique_files": unique,
         "re_edits": {Path(f).name: c for f, c in re_edits.items()},
@@ -480,13 +490,21 @@ def _analyze_thrash(events: list[dict]) -> dict:
 
 
 def _analyze_prompt_clarity(events: list[dict]) -> dict:
-    """EFFICIENCY: Measure how many user messages before first productive output.
+    """PROCESS METRIC: Measure session structure — exploration vs output.
+
+    NOT a quality score. Discussion-heavy sessions (architecture, planning,
+    debugging) are legitimate and should not be penalized. This metric
+    describes the session shape, not its quality.
+
     Thresholds sourced from thresholds.json → prompt_clarity."""
     t = _load_thresholds().get("prompt_clarity", {})
 
     user_msgs_before_output = 0
     total_user_msgs = 0
     found_output = False
+    # Detect if pre-output phase included research tools (Read/Grep/Glob)
+    # which signals deliberate exploration, not unclear prompting
+    research_before_output = 0
 
     for ev in events:
         if ev.get("type") == "user":
@@ -494,39 +512,52 @@ def _analyze_prompt_clarity(events: list[dict]) -> dict:
             if not found_output:
                 user_msgs_before_output += 1
 
-        if ev.get("type") == "assistant" and not found_output:
+        if ev.get("type") == "assistant":
             content = ev.get("message", {}).get("content", [])
             if not isinstance(content, list):
                 continue
             for block in content:
-                if block.get("type") == "tool_use" and block.get("name") in ("Write", "Edit"):
+                if block.get("type") != "tool_use":
+                    continue
+                if not found_output and block.get("name") in ("Read", "Grep", "Glob", "Agent"):
+                    research_before_output += 1
+                if block.get("name") in ("Write", "Edit"):
                     found_output = True
-                    break
 
+    # Classify session shape rather than scoring quality
     if not found_output:
-        score = t.get("no_output_score", 30)
+        shape = "exploration_only"
     elif user_msgs_before_output <= t.get("perfect_prompts", 1):
-        score = 100
-    elif user_msgs_before_output <= t.get("good_prompts", 2):
-        score = 90
+        shape = "direct_execution"
     elif user_msgs_before_output <= t.get("ok_prompts", 4):
-        score = 75
-    elif total_user_msgs > 0:
-        warmup_ratio = user_msgs_before_output / total_user_msgs
-        if warmup_ratio < t.get("warmup_ratio_good", 0.15):
-            score = 70
-        elif warmup_ratio < t.get("warmup_ratio_ok", 0.30):
-            score = 55
-        elif warmup_ratio < t.get("warmup_ratio_poor", 0.50):
-            score = 40
-        else:
-            score = 25
+        shape = "brief_alignment"
+    elif research_before_output >= 5:
+        shape = "research_then_build"  # deliberate — not a clarity problem
     else:
-        score = 20
+        warmup_ratio = (user_msgs_before_output / total_user_msgs
+                        if total_user_msgs > 0 else 1.0)
+        if warmup_ratio < t.get("warmup_ratio_ok", 0.30):
+            shape = "extended_discussion"
+        else:
+            shape = "late_start"
+
+    # Process score — descriptive, not judgmental
+    # research_then_build and direct_execution both score well
+    shape_scores = {
+        "direct_execution": 100,
+        "brief_alignment": 85,
+        "research_then_build": 80,  # deliberate exploration is fine
+        "extended_discussion": 60,
+        "late_start": 40,
+        "exploration_only": t.get("no_output_score", 30),
+    }
+    score = shape_scores.get(shape, 50)
 
     return {
-        "layer": "efficiency",
+        "layer": "process",
+        "session_shape": shape,
         "prompts_before_output": user_msgs_before_output,
+        "research_calls_before_output": research_before_output,
         "total_prompts": total_user_msgs,
         "had_output": found_output,
         "score": score,
@@ -593,7 +624,7 @@ def _analyze_cost_efficiency(events: list[dict]) -> dict:
         score = 20
 
     return {
-        "layer": "efficiency",
+        "layer": "process",
         "total_tokens": total_tokens,
         "est_cost": round(total_cost, 4),
         "productive_calls": productive_calls,
@@ -716,9 +747,17 @@ def _analyze_antipatterns(events: list[dict]) -> dict:
 def _run_analysis(session_file: Path) -> dict:
     """Run all analysis passes on a session file.
 
-    Returns scores split into two layers:
-      - compliance: tool_selection, anti_patterns (from baseline.json)
-      - efficiency: planning, prompt_clarity, cost_efficiency (from thresholds.json)
+    Returns two distinct layers:
+      - compliance: graded (A-F). Did Claude follow its documented rules?
+        Sourced from baseline.json. Objective, binary checks.
+      - process: ungraded descriptive metrics. How did the session behave?
+        Sourced from thresholds.json. Useful for spotting outliers,
+        NOT for judging session quality.
+
+    Only compliance gets a letter grade because it has ground truth
+    (documented rules with right/wrong answers). Process metrics describe
+    behavior without claiming good or bad — task complexity, model choice,
+    and session intent all affect these numbers legitimately.
     """
     events = _parse_session_events(session_file)
     if not events:
@@ -734,40 +773,43 @@ def _run_analysis(session_file: Path) -> dict:
         "tool_selection": tool_sel["score"],
         "anti_patterns": anti["score"],
     }
-    efficiency_scores = {
+    process_scores = {
         "planning": thrash["score"],
-        "prompt_clarity": clarity["score"],
+        "session_shape": clarity["score"],
         "cost_efficiency": cost["score"],
     }
-    all_scores = {**compliance_scores, **efficiency_scores}
-    overall = round(sum(all_scores.values()) / len(all_scores), 1)
     compliance_avg = round(sum(compliance_scores.values()) / len(compliance_scores), 1)
-    efficiency_avg = round(sum(efficiency_scores.values()) / len(efficiency_scores), 1)
+    process_avg = round(sum(process_scores.values()) / len(process_scores), 1)
 
-    # Grade from thresholds
+    # Only compliance gets a letter grade — it has ground truth
     grades = _load_thresholds().get("grades", {"A": 85, "B": 70, "C": 55, "D": 40})
-    if overall >= grades.get("A", 85):
-        grade = "A"
-    elif overall >= grades.get("B", 70):
-        grade = "B"
-    elif overall >= grades.get("C", 55):
-        grade = "C"
-    elif overall >= grades.get("D", 40):
-        grade = "D"
+    if compliance_avg >= grades.get("A", 85):
+        compliance_grade = "A"
+    elif compliance_avg >= grades.get("B", 70):
+        compliance_grade = "B"
+    elif compliance_avg >= grades.get("C", 55):
+        compliance_grade = "C"
+    elif compliance_avg >= grades.get("D", 40):
+        compliance_grade = "D"
     else:
-        grade = "F"
+        compliance_grade = "F"
 
     return {
         "heuristic_version": HEURISTIC_VERSION,
         "baseline_source": "Claude Code system prompt (via baseline.json)",
-        "overall_score": overall,
-        "grade": grade,
-        "compliance_score": compliance_avg,
-        "efficiency_score": efficiency_avg,
-        "scores": all_scores,
+        "compliance": {
+            "grade": compliance_grade,
+            "score": compliance_avg,
+            "scores": compliance_scores,
+        },
+        "process": {
+            "score": process_avg,
+            "scores": process_scores,
+            "note": "Descriptive metrics, not quality judgment. Affected by task complexity, model choice, and session intent.",
+        },
         "tool_selection": tool_sel,
         "thrash_analysis": thrash,
-        "prompt_clarity": clarity,
+        "session_shape": clarity,
         "cost_efficiency": cost,
         "anti_patterns": anti,
     }
@@ -830,15 +872,14 @@ def cmd_quality(args):
                 "date": datetime.fromtimestamp(
                     jf.stat().st_mtime, tz=timezone.utc
                 ).strftime("%Y-%m-%d"),
-                "grade": result["grade"],
-                "overall": result["overall_score"],
-                "compliance": result["compliance_score"],
-                "efficiency": result["efficiency_score"],
-                "scores": result["scores"],
+                "compliance_grade": result["compliance"]["grade"],
+                "compliance_score": result["compliance"]["score"],
+                "process_score": result["process"]["score"],
                 "tokens": result["cost_efficiency"]["total_tokens"],
                 "cost": result["cost_efficiency"]["est_cost"],
                 "misuses": result["tool_selection"]["misuse_count"],
                 "thrash_ratio": result["thrash_analysis"]["thrash_ratio"],
+                "session_shape": result["session_shape"]["session_shape"],
                 "issues": result["anti_patterns"]["issue_count"],
             })
 
@@ -849,68 +890,60 @@ def cmd_quality(args):
     sessions.sort(key=lambda s: s["date"], reverse=True)
     sessions = sessions[:args.limit]
 
-    # Aggregate stats
-    all_scores = [s["overall"] for s in sessions]
-    grade_dist = Counter(s["grade"] for s in sessions)
+    n = len(sessions)
     total_cost = sum(s["cost"] for s in sessions)
     total_tokens = sum(s["tokens"] for s in sessions)
-    avg_score = round(sum(all_scores) / len(all_scores), 1)
 
-    # Category averages
-    cat_totals = {"tool_selection": 0, "planning": 0, "prompt_clarity": 0,
-                  "cost_efficiency": 0, "anti_patterns": 0}
-    for s in sessions:
-        for cat, val in s["scores"].items():
-            cat_totals[cat] += val
-    cat_avgs = {k: round(v / len(sessions), 1) for k, v in cat_totals.items()}
+    # Compliance aggregates (graded)
+    avg_compliance = round(sum(s["compliance_score"] for s in sessions) / n, 1)
+    compliance_grades = Counter(s["compliance_grade"] for s in sessions)
 
-    # Weakest category
-    weakest = min(cat_avgs, key=cat_avgs.get)
+    # Process aggregates (descriptive, not graded)
+    avg_process = round(sum(s["process_score"] for s in sessions) / n, 1)
+    shape_dist = Counter(s["session_shape"] for s in sessions)
 
-    # Bottom 5 sessions
-    worst = sorted(sessions, key=lambda s: s["overall"])[:5]
-
-    # Layer averages
-    avg_compliance = round(
-        sum(s["compliance"] for s in sessions) / len(sessions), 1
-    )
-    avg_efficiency = round(
-        sum(s["efficiency"] for s in sessions) / len(sessions), 1
-    )
+    # Lowest compliance sessions (these are actionable)
+    worst_compliance = sorted(sessions, key=lambda s: s["compliance_score"])[:5]
 
     output = {
         "summary": {
             "heuristic_version": HEURISTIC_VERSION,
             "baseline_source": "Claude Code system prompt (via baseline.json)",
-            "sessions_analyzed": len(sessions),
+            "sessions_analyzed": n,
             "days": args.days,
-            "avg_score": avg_score,
-            "avg_compliance": avg_compliance,
-            "avg_efficiency": avg_efficiency,
-            "grade_distribution": dict(grade_dist.most_common()),
             "total_cost": round(total_cost, 4),
             "total_tokens": total_tokens,
-            "category_averages": cat_avgs,
-            "weakest_category": weakest,
         },
-        "worst_sessions": [
+        "compliance": {
+            "note": "Graded. Did Claude follow its documented system prompt rules?",
+            "avg_score": avg_compliance,
+            "grade_distribution": dict(compliance_grades.most_common()),
+        },
+        "process": {
+            "note": "Descriptive only. Affected by task complexity, model choice, and session intent. Not a quality judgment.",
+            "avg_score": avg_process,
+            "session_shapes": dict(shape_dist.most_common()),
+        },
+        "worst_compliance": [
             {
                 "session_id": s["session_id"][:12],
                 "project": s["project"].split("/")[-1],
                 "date": s["date"],
-                "grade": s["grade"],
-                "score": s["overall"],
+                "compliance": s["compliance_grade"],
+                "score": s["compliance_score"],
+                "misuses": s["misuses"],
                 "issues": s["issues"],
             }
-            for s in worst
+            for s in worst_compliance
         ],
         "recent": [
             {
                 "session_id": s["session_id"][:12],
                 "project": s["project"].split("/")[-1],
                 "date": s["date"],
-                "grade": s["grade"],
-                "score": s["overall"],
+                "compliance": s["compliance_grade"],
+                "process": s["process_score"],
+                "shape": s["session_shape"],
             }
             for s in sessions[:10]
         ],

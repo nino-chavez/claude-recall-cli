@@ -72,32 +72,38 @@ You can adjust `--min-score` (0-100, default 30) and `--days` to tune sensitivit
 
 ## Quality analysis
 
-`/recall analyze` and `/recall quality` score sessions across two independent layers:
+`/recall analyze` and `/recall quality` assess sessions across two independent layers:
 
-### Compliance (from `baseline.json`)
+### Compliance — graded (A-F)
 
-Objective checks: did Claude follow its own documented system prompt rules?
+**Did Claude follow its own documented system prompt rules?** These checks have ground truth — documented instructions with right/wrong answers.
 
 - **Tool selection** — Bash calls that should have used Read/Edit/Grep/Glob (rules extracted from Claude Code's system prompt)
 - **Anti-patterns** — Retry loops, exploration dead-ends, edits without prior reads, excessive sub-agents
 
-Rules are sourced from [Claude Code system prompts](https://github.com/Piebald-AI/claude-code-system-prompts). Update `baseline.json` when Claude Code releases new tool guidance.
+Rules sourced from [Claude Code system prompts](https://github.com/Piebald-AI/claude-code-system-prompts) via `baseline.json`. Update when Claude Code releases new tool guidance.
 
-### Efficiency (from `thresholds.json`)
+### Process metrics — descriptive only, NOT graded
 
-Subjective checks: did Claude work within acceptable cost/effort bounds?
+**How did the session behave?** These metrics describe session shape, not quality. Task complexity, model choice, and session intent all affect them legitimately. A research-heavy Opus session is not "worse" than a quick Haiku fix.
 
-- **Planning** — File thrash ratio (same file edited repeatedly = poor planning)
-- **Prompt clarity** — Prompts before first productive output
-- **Cost efficiency** — Tokens per productive tool call (model-dependent)
+- **Planning** — File thrash ratio (same file edited repeatedly)
+- **Session shape** — Classified as `direct_execution`, `brief_alignment`, `research_then_build`, `extended_discussion`, `late_start`, or `exploration_only`
+- **Cost efficiency** — Tokens per productive tool call (heavily model-dependent)
 
-Thresholds are user-tunable. Edit `thresholds.json` to match your workflow.
+Thresholds in `thresholds.json` are user-tunable.
+
+### Outcome tracking (manual, for future correlation)
+
+The database schema includes `outcome_verified` and `had_followup_fix` columns. Set these manually on saved entries to build a dataset correlating process metrics with actual outcomes. This is the path to real quality measurement.
 
 ### Versioning
 
-Every output includes `heuristic_version` (currently v2). Bump `HEURISTIC_VERSION` in `recall-cli.py` when you change scoring rules. Scores from different versions should not be compared.
+Every output includes `heuristic_version` (currently v3). Bump `HEURISTIC_VERSION` in `recall-cli.py` when you change scoring rules. Scores from different versions should not be compared.
 
-This analysis is **not derived from or comparative to any Anthropic internal evaluation framework**. It is an independent quality assessment based on observable session behavior.
+### What this is NOT
+
+This analysis is **not derived from or comparative to any Anthropic internal evaluation framework**. Compliance checks whether Claude followed its published rules. Process metrics are descriptive telemetry. Neither claims to measure the quality of the code produced or the user's satisfaction with the session.
 
 ## Update
 
