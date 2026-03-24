@@ -131,26 +131,65 @@ def _migrate(db: sqlite3.Connection):
         """)
         db.execute("UPDATE schema_version SET version = 2")
         db.commit()
+        version = 2
+
+    if version < 3:
+        # Store analysis metrics alongside entries for future correlation
+        db.executescript("""
+            ALTER TABLE recipes ADD COLUMN commits_produced INTEGER DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN user_satisfaction INTEGER DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN compliance_grade TEXT DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN compliance_score REAL DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN process_score REAL DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN session_shape TEXT DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN thrash_ratio REAL DEFAULT NULL;
+            ALTER TABLE recipes ADD COLUMN tokens_per_output INTEGER DEFAULT NULL;
+        """)
+        db.execute("UPDATE schema_version SET version = 3")
+        db.commit()
 
 
 def cmd_save(args):
-    """Save an entry to the database."""
+    """Save an entry to the database with auto-populated analysis metrics."""
     db = get_db()
     recipe_id = str(uuid.uuid4())[:8]
 
     # Calculate token count and cost from session if available
     token_count = None
     est_cost = None
+    compliance_grade = None
+    compliance_score_val = None
+    process_score_val = None
+    session_shape_val = None
+    thrash_ratio_val = None
+    tokens_per_output_val = None
+    commits = None
+
     session_file = _find_session_file(args.session_id, args.project)
     if session_file:
         token_count, est_cost = _extract_session_cost(session_file)
+
+        # Auto-populate analysis metrics for future correlation
+        analysis = _run_analysis(session_file)
+        if "error" not in analysis:
+            compliance_grade = analysis["compliance"]["grade"]
+            compliance_score_val = analysis["compliance"]["score"]
+            process_score_val = analysis["process"]["score"]
+            session_shape_val = analysis["session_shape"]["session_shape"]
+            thrash_ratio_val = analysis["thrash_analysis"]["thrash_ratio"]
+            tokens_per_output_val = analysis["cost_efficiency"]["tokens_per_output"]
+
+        # Count git commits in session
+        commits = _count_commits(session_file)
 
     db.execute(
         """INSERT INTO recipes
            (id, session_id, project_path, intent, sources, key_commands,
             outcome, prompt_template, tags, quality_class, quality_reason,
-            est_cost, token_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            est_cost, token_count, compliance_grade, compliance_score,
+            process_score, session_shape, thrash_ratio, tokens_per_output,
+            commits_produced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             recipe_id,
             args.session_id,
@@ -165,6 +204,13 @@ def cmd_save(args):
             args.quality_reason,
             est_cost,
             token_count,
+            compliance_grade,
+            compliance_score_val,
+            process_score_val,
+            session_shape_val,
+            thrash_ratio_val,
+            tokens_per_output_val,
+            commits,
         ),
     )
     db.commit()
@@ -175,8 +221,13 @@ def cmd_save(args):
         "id": recipe_id,
         "intent": args.intent,
         "quality_class": args.quality_class,
+        "compliance_grade": compliance_grade,
+        "process_score": process_score_val,
+        "session_shape": session_shape_val,
         "est_cost": est_cost,
         "token_count": token_count,
+        "commits_produced": commits,
+        "tip": f"Rate this session: /recall verify {recipe_id} --outcome pass|fail",
     }, indent=2))
 
 
@@ -952,6 +1003,137 @@ def cmd_quality(args):
     print(json.dumps(output, indent=2))
 
 
+def _count_commits(session_file: Path) -> int:
+    """Count git commit commands in a session."""
+    count = 0
+    try:
+        with open(session_file) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                content = obj.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (block.get("type") == "tool_use"
+                            and block.get("name") == "Bash"
+                            and "git commit" in block.get("input", {}).get("command", "")):
+                        count += 1
+    except Exception:
+        pass
+    return count
+
+
+def cmd_verify(args):
+    """Mark a saved entry with outcome data for quality correlation."""
+    db = get_db()
+
+    row = db.execute(
+        "SELECT id, intent, outcome_verified, user_satisfaction FROM recipes "
+        "WHERE id = ? OR id LIKE ?",
+        (args.id, f"{args.id}%"),
+    ).fetchone()
+
+    if not row:
+        print(json.dumps({"error": f"Entry '{args.id}' not found"}))
+        sys.exit(1)
+
+    entry = dict(row)
+    updates = {}
+
+    if args.outcome is not None:
+        updates["outcome_verified"] = 1 if args.outcome == "pass" else 0
+    if args.satisfaction is not None:
+        updates["user_satisfaction"] = args.satisfaction
+    if args.followup is not None:
+        updates["had_followup_fix"] = 1 if args.followup == "yes" else 0
+
+    if not updates:
+        print(json.dumps({"error": "No outcome flags provided. Use --outcome, --satisfaction, or --followup"}))
+        sys.exit(1)
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [entry["id"]]
+    db.execute(f"UPDATE recipes SET {set_clause} WHERE id = ?", values)
+    db.commit()
+
+    # Read back
+    row = db.execute("SELECT * FROM recipes WHERE id = ?", (entry["id"],)).fetchone()
+    result = {
+        "status": "verified",
+        "id": entry["id"],
+        "intent": entry["intent"],
+        "outcome_verified": row["outcome_verified"],
+        "user_satisfaction": row["user_satisfaction"],
+        "had_followup_fix": row["had_followup_fix"],
+    }
+    print(json.dumps(result, indent=2))
+    db.close()
+
+
+def cmd_backfill(args):
+    """Backfill analysis metrics on existing entries missing them."""
+    db = get_db()
+
+    rows = db.execute(
+        "SELECT id, session_id, project_path FROM recipes WHERE compliance_grade IS NULL"
+    ).fetchall()
+
+    if not rows:
+        print(json.dumps({"status": "nothing_to_backfill", "message": "All entries already have analysis metrics"}))
+        return
+
+    filled = 0
+    skipped = 0
+
+    for row in rows:
+        session_file = _find_session_file(row["session_id"])
+        if not session_file:
+            skipped += 1
+            continue
+
+        analysis = _run_analysis(session_file)
+        if "error" in analysis:
+            skipped += 1
+            continue
+
+        commits = _count_commits(session_file)
+
+        db.execute(
+            """UPDATE recipes SET
+                compliance_grade = ?, compliance_score = ?, process_score = ?,
+                session_shape = ?, thrash_ratio = ?, tokens_per_output = ?,
+                commits_produced = ?
+               WHERE id = ?""",
+            (
+                analysis["compliance"]["grade"],
+                analysis["compliance"]["score"],
+                analysis["process"]["score"],
+                analysis["session_shape"]["session_shape"],
+                analysis["thrash_analysis"]["thrash_ratio"],
+                analysis["cost_efficiency"]["tokens_per_output"],
+                commits,
+                row["id"],
+            ),
+        )
+        filled += 1
+
+    db.commit()
+    db.close()
+
+    print(json.dumps({
+        "status": "backfilled",
+        "filled": filled,
+        "skipped": skipped,
+        "total": len(rows),
+        "message": f"Backfilled {filled}/{len(rows)} entries ({skipped} session files not found)",
+    }, indent=2))
+
+
 def _find_session_file(session_id: str, project_path: str = None) -> Path | None:
     """Locate a session JSONL file."""
     projects_dir = Path.home() / ".claude" / "projects"
@@ -1072,6 +1254,20 @@ def main():
     quality_p.add_argument("--limit", type=int, default=50,
                            help="Max sessions to analyze")
 
+    # verify
+    verify_p = sub.add_parser("verify")
+    verify_p.add_argument("id")
+    verify_p.add_argument("--outcome", choices=["pass", "fail"], default=None,
+                          help="Did the session produce working code?")
+    verify_p.add_argument("--satisfaction", type=int, choices=range(1, 6),
+                          default=None, metavar="1-5",
+                          help="User satisfaction rating (1=terrible, 5=excellent)")
+    verify_p.add_argument("--followup", choices=["yes", "no"], default=None,
+                          help="Was there a follow-up fix session?")
+
+    # backfill
+    sub.add_parser("backfill")
+
     args = parser.parse_args()
 
     if args.command == "save":
@@ -1090,6 +1286,10 @@ def main():
         cmd_analyze(args)
     elif args.command == "quality":
         cmd_quality(args)
+    elif args.command == "verify":
+        cmd_verify(args)
+    elif args.command == "backfill":
+        cmd_backfill(args)
     else:
         parser.print_help()
         sys.exit(1)

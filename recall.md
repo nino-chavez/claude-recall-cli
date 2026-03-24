@@ -13,6 +13,8 @@ Save the current session as a reusable recall entry, or search past entries.
 - `/recall stats` — Show library statistics (counts, tags, cost)
 - `/recall analyze` — Analyze current or specific session for quality
 - `/recall quality` — Quality trends across recent sessions
+- `/recall verify <id>` — Rate a session's outcome for quality correlation
+- `/recall backfill` — Backfill analysis metrics on older entries
 
 ## Instructions
 
@@ -125,8 +127,24 @@ python3 ~/.claude/commands/recall-cli.py quality --days <N|all> --limit 50
 ```
 
 Display a trends dashboard with:
-- Average score and grade distribution across sessions
-- Category averages (which dimension is weakest overall)
+- Compliance grade distribution (graded, from baseline.json)
+- Process metric averages and session shape distribution (descriptive, not graded)
 - Total cost and tokens across the period
-- Worst 5 sessions (investigate these)
-- Recent 10 sessions with grades
+- Worst compliance sessions (investigate these)
+- Recent sessions with compliance grades and process scores
+
+When the user runs `/recall verify <id>`:
+
+```bash
+python3 ~/.claude/commands/recall-cli.py verify "<id>" --outcome pass|fail --satisfaction 1-5 --followup yes|no
+```
+
+All flags are optional but at least one must be provided. This labels saved entries with outcome data for future quality correlation. After saving a new entry, always prompt the user to verify it.
+
+When the user runs `/recall backfill`:
+
+```bash
+python3 ~/.claude/commands/recall-cli.py backfill
+```
+
+Retroactively fills analysis metrics (compliance grade, process score, session shape, thrash ratio, etc.) on existing entries that were saved before the analysis feature existed. Only works for entries whose session JSONL files still exist.
