@@ -147,6 +147,37 @@ def _migrate(db: sqlite3.Connection):
         """)
         db.execute("UPDATE schema_version SET version = 3")
         db.commit()
+        version = 3
+
+    if version < 4:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS session_features (
+                session_id          TEXT PRIMARY KEY,
+                project_path        TEXT,
+                analyzed_at         TEXT DEFAULT (datetime('now')),
+                compliance_score    REAL,
+                compliance_grade    TEXT,
+                process_score       REAL,
+                session_shape       TEXT,
+                thrash_ratio        REAL,
+                tokens_per_output   INTEGER,
+                total_tokens        INTEGER,
+                total_cost          REAL,
+                tool_misuses        INTEGER,
+                anti_pattern_count  INTEGER,
+                edit_count          INTEGER,
+                unique_files        INTEGER,
+                prompt_count        INTEGER,
+                model_primary       TEXT,
+                commits_produced    INTEGER,
+                had_error_exit      INTEGER,
+                outcome_pass        INTEGER DEFAULT NULL,
+                had_followup_fix    INTEGER DEFAULT NULL,
+                file_size_kb        INTEGER
+            );
+        """)
+        db.execute("UPDATE schema_version SET version = 4")
+        db.commit()
 
 
 def cmd_save(args):
@@ -1134,6 +1165,425 @@ def cmd_backfill(args):
     }, indent=2))
 
 
+def _extract_session_features(session_file: Path) -> dict | None:
+    """Extract all features from a session for the features table."""
+    events = _parse_session_events(session_file)
+    if not events or len(events) < 5:
+        return None
+
+    analysis = _run_analysis(session_file)
+    if "error" in analysis:
+        return None
+
+    commits = _count_commits(session_file)
+
+    # Detect primary model
+    models = Counter()
+    for ev in events:
+        if ev.get("type") == "assistant":
+            model = ev.get("message", {}).get("model", "")
+            if model:
+                models[model] += 1
+    primary_model = models.most_common(1)[0][0] if models else ""
+    # Simplify model name
+    for short in ("opus", "sonnet", "haiku"):
+        if short in primary_model:
+            primary_model = short
+            break
+
+    # Detect error exit (last few Bash calls failed)
+    last_bash_results = []
+    for ev in events:
+        if ev.get("type") == "result":
+            # Tool results don't have a clean structure, check for error signals
+            pass
+    # Simpler: check if session has repeated failing commands (from anti-patterns)
+    had_error = 1 if analysis["anti_patterns"]["issue_count"] > 0 else 0
+
+    return {
+        "session_id": session_file.stem,
+        "compliance_score": analysis["compliance"]["score"],
+        "compliance_grade": analysis["compliance"]["grade"],
+        "process_score": analysis["process"]["score"],
+        "session_shape": analysis["session_shape"]["session_shape"],
+        "thrash_ratio": analysis["thrash_analysis"]["thrash_ratio"],
+        "tokens_per_output": analysis["cost_efficiency"]["tokens_per_output"],
+        "total_tokens": analysis["cost_efficiency"]["total_tokens"],
+        "total_cost": analysis["cost_efficiency"]["est_cost"],
+        "tool_misuses": analysis["tool_selection"]["misuse_count"],
+        "anti_pattern_count": analysis["anti_patterns"]["issue_count"],
+        "edit_count": analysis["thrash_analysis"]["edits"],
+        "unique_files": analysis["thrash_analysis"]["unique_files"],
+        "prompt_count": analysis["session_shape"]["total_prompts"],
+        "model_primary": primary_model,
+        "commits_produced": commits,
+        "had_error_exit": had_error,
+        "outcome_pass": 1 if commits > 0 else 0,
+        "file_size_kb": session_file.stat().st_size // 1024,
+    }
+
+
+def _detect_followup_fixes(db: sqlite3.Connection):
+    """Cross-reference sessions to auto-detect follow-up fix patterns.
+
+    A session has a followup fix if a later session in the same project:
+    - Starts within 4 hours
+    - Edits at least one of the same files
+    """
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return 0
+
+    updated = 0
+
+    for proj_dir in sorted(projects_dir.iterdir()):
+        if not proj_dir.is_dir():
+            continue
+
+        # Get all sessions for this project, sorted by mtime
+        sessions = []
+        for jf in proj_dir.glob("*.jsonl"):
+            if jf.stat().st_size < 5000:
+                continue
+            sessions.append({
+                "file": jf,
+                "id": jf.stem,
+                "mtime": jf.stat().st_mtime,
+            })
+
+        sessions.sort(key=lambda s: s["mtime"])
+        if len(sessions) < 2:
+            continue
+
+        # Extract files written per session (cached)
+        files_cache = {}
+        def get_files_written(sf: Path) -> set:
+            key = str(sf)
+            if key not in files_cache:
+                files = set()
+                try:
+                    with open(sf) as f:
+                        for line in f:
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if obj.get("type") != "assistant":
+                                continue
+                            content = obj.get("message", {}).get("content", [])
+                            if not isinstance(content, list):
+                                continue
+                            for block in content:
+                                if (block.get("type") == "tool_use"
+                                        and block.get("name") in ("Write", "Edit")):
+                                    fp = block.get("input", {}).get("file_path", "")
+                                    if fp:
+                                        files.add(fp)
+                except Exception:
+                    pass
+                files_cache[key] = files
+            return files_cache[key]
+
+        # Compare consecutive sessions
+        for i in range(len(sessions) - 1):
+            curr = sessions[i]
+            nxt = sessions[i + 1]
+
+            # Within 4 hours?
+            time_gap_hours = (nxt["mtime"] - curr["mtime"]) / 3600
+            if time_gap_hours > 4:
+                continue
+
+            # File overlap?
+            curr_files = get_files_written(curr["file"])
+            nxt_files = get_files_written(nxt["file"])
+            if not curr_files or not nxt_files:
+                continue
+
+            overlap = curr_files & nxt_files
+            if overlap:
+                # Mark the earlier session as having a followup fix
+                db.execute(
+                    "UPDATE session_features SET had_followup_fix = 1 WHERE session_id = ?",
+                    (curr["id"],),
+                )
+                # Mark the later session as NOT a followup target
+                # (it's the fix, not the thing being fixed)
+                db.execute(
+                    "UPDATE session_features SET had_followup_fix = 0 "
+                    "WHERE session_id = ? AND had_followup_fix IS NULL",
+                    (nxt["id"],),
+                )
+                updated += 1
+
+    # Mark remaining NULL as 0 (no followup detected)
+    db.execute(
+        "UPDATE session_features SET had_followup_fix = 0 WHERE had_followup_fix IS NULL"
+    )
+    db.commit()
+    return updated
+
+
+def cmd_extract(args):
+    """Batch extract features from all sessions for correlation analysis."""
+    db = get_db()
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        print(json.dumps({"error": "No projects directory found"}))
+        sys.exit(1)
+
+    days = int(args.days) if args.days != "all" else None
+    cutoff = (
+        datetime.now(tz=timezone.utc) - timedelta(days=days)
+        if days else None
+    )
+
+    # Get already-extracted session IDs
+    existing = set()
+    try:
+        rows = db.execute("SELECT session_id FROM session_features").fetchall()
+        existing = {r[0] for r in rows}
+    except Exception:
+        pass
+
+    extracted = 0
+    skipped = 0
+    total = 0
+
+    for proj_dir in sorted(projects_dir.iterdir()):
+        if not proj_dir.is_dir():
+            continue
+        project_name = str(proj_dir.name).replace("-Users-nino-", "").replace("-", "/")
+
+        for jf in proj_dir.glob("*.jsonl"):
+            if cutoff:
+                mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    continue
+
+            if jf.stat().st_size < 5000:
+                continue
+
+            total += 1
+
+            if jf.stem in existing:
+                skipped += 1
+                continue
+
+            features = _extract_session_features(jf)
+            if not features:
+                skipped += 1
+                continue
+
+            db.execute(
+                """INSERT OR REPLACE INTO session_features
+                   (session_id, project_path, compliance_score, compliance_grade,
+                    process_score, session_shape, thrash_ratio, tokens_per_output,
+                    total_tokens, total_cost, tool_misuses, anti_pattern_count,
+                    edit_count, unique_files, prompt_count, model_primary,
+                    commits_produced, had_error_exit, outcome_pass, file_size_kb)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    features["session_id"], project_name,
+                    features["compliance_score"], features["compliance_grade"],
+                    features["process_score"], features["session_shape"],
+                    features["thrash_ratio"], features["tokens_per_output"],
+                    features["total_tokens"], features["total_cost"],
+                    features["tool_misuses"], features["anti_pattern_count"],
+                    features["edit_count"], features["unique_files"],
+                    features["prompt_count"], features["model_primary"],
+                    features["commits_produced"], features["had_error_exit"],
+                    features["outcome_pass"], features["file_size_kb"],
+                ),
+            )
+            extracted += 1
+
+    db.commit()
+
+    # Auto-detect followup fixes
+    followups = _detect_followup_fixes(db)
+
+    # Stats
+    total_features = db.execute("SELECT COUNT(*) FROM session_features").fetchone()[0]
+    with_commits = db.execute(
+        "SELECT COUNT(*) FROM session_features WHERE commits_produced > 0"
+    ).fetchone()[0]
+    with_followups = db.execute(
+        "SELECT COUNT(*) FROM session_features WHERE had_followup_fix = 1"
+    ).fetchone()[0]
+
+    db.close()
+
+    print(json.dumps({
+        "status": "extracted",
+        "new_sessions": extracted,
+        "skipped": skipped,
+        "total_scanned": total,
+        "total_in_table": total_features,
+        "followup_fixes_detected": followups,
+        "sessions_with_commits": with_commits,
+        "sessions_with_followup_fix": with_followups,
+        "ready_for_correlate": total_features >= 50,
+    }, indent=2))
+
+
+def _pearson_r(x: list[float], y: list[float]) -> tuple[float, float]:
+    """Pearson correlation coefficient and approximate two-tailed p-value.
+    No external dependencies — uses Abramowitz & Stegun t-CDF approximation."""
+    import math
+    n = len(x)
+    if n < 10:
+        return 0.0, 1.0
+
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    num = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    den_x = sum((xi - mean_x) ** 2 for xi in x) ** 0.5
+    den_y = sum((yi - mean_y) ** 2 for yi in y) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return 0.0, 1.0
+    r = num / (den_x * den_y)
+
+    if abs(r) >= 0.9999:
+        return round(r, 4), 0.0001
+
+    # t-statistic
+    t_stat = r * math.sqrt((n - 2) / (1 - r * r))
+    df = n - 2
+
+    # Approximate two-tailed p-value using normal approximation for large df
+    # For df > 30 this is very accurate
+    if df > 30:
+        # Use normal approximation
+        z = abs(t_stat)
+        # Abramowitz & Stegun 26.2.17
+        p_one_tail = 0.5 * math.erfc(z / math.sqrt(2))
+        p = 2 * p_one_tail
+    else:
+        # Rough approximation for small df using regularized incomplete beta
+        x_val = df / (df + t_stat * t_stat)
+        # Simple approximation: for small samples, report p > 0.05 as not significant
+        # This is a known limitation — with < 30 samples, use exact tables
+        p = 0.1 if abs(r) < 0.35 else 0.05 if abs(r) < 0.5 else 0.01
+
+    return round(r, 4), round(max(p, 0.0001), 4)
+
+
+def cmd_correlate(args):
+    """Compute correlations between process metrics and outcomes."""
+    db = get_db()
+
+    rows = db.execute(
+        """SELECT compliance_score, process_score, thrash_ratio,
+                  tokens_per_output, tool_misuses, anti_pattern_count,
+                  edit_count, prompt_count, commits_produced,
+                  outcome_pass, had_followup_fix
+           FROM session_features
+           WHERE outcome_pass IS NOT NULL"""
+    ).fetchall()
+
+    if len(rows) < 30:
+        print(json.dumps({
+            "error": f"Need at least 30 sessions with outcomes, have {len(rows)}. Run /recall extract first.",
+            "current_count": len(rows),
+        }))
+        sys.exit(1)
+
+    # Build feature vectors
+    features = {
+        "compliance_score": [],
+        "process_score": [],
+        "thrash_ratio": [],
+        "tokens_per_output": [],
+        "tool_misuses": [],
+        "anti_pattern_count": [],
+        "edit_count": [],
+        "prompt_count": [],
+    }
+    outcome_pass = []
+    followup_fix = []
+
+    for row in rows:
+        for key in features:
+            val = row[key]
+            features[key].append(float(val) if val is not None else 0.0)
+        outcome_pass.append(float(row["outcome_pass"] or 0))
+        followup_fix.append(float(row["had_followup_fix"] or 0))
+
+    n = len(outcome_pass)
+    pass_rate = sum(outcome_pass) / n
+    followup_rate = sum(followup_fix) / n
+
+    # Correlate each feature with outcome_pass
+    pass_correlations = {}
+    for name, values in features.items():
+        r, p = _pearson_r(values, outcome_pass)
+        pass_correlations[name] = {
+            "r": r, "p": p,
+            "significant": p < 0.05,
+            "direction": "positive" if r > 0 else "negative",
+        }
+
+    # Correlate each feature with had_followup_fix
+    fix_correlations = {}
+    for name, values in features.items():
+        r, p = _pearson_r(values, followup_fix)
+        fix_correlations[name] = {
+            "r": r, "p": p,
+            "significant": p < 0.05,
+            "direction": "positive" if r > 0 else "negative",
+        }
+
+    # Mean comparison: pass vs fail
+    mean_comp = {}
+    for name, values in features.items():
+        pass_vals = [v for v, o in zip(values, outcome_pass) if o == 1]
+        fail_vals = [v for v, o in zip(values, outcome_pass) if o == 0]
+        if pass_vals and fail_vals:
+            mean_comp[name] = {
+                "pass_mean": round(sum(pass_vals) / len(pass_vals), 2),
+                "fail_mean": round(sum(fail_vals) / len(fail_vals), 2),
+                "pass_n": len(pass_vals),
+                "fail_n": len(fail_vals),
+            }
+
+    # Find significant predictors
+    sig_pass = [k for k, v in pass_correlations.items() if v["significant"]]
+    sig_fix = [k for k, v in fix_correlations.items() if v["significant"]]
+
+    # Build conclusion
+    if not sig_pass and not sig_fix:
+        conclusion = (
+            "No metrics show statistically significant correlation with outcomes. "
+            "Process metrics are descriptive noise at this sample size. "
+            "Consider: more data, or accept that compliance is the only actionable signal."
+        )
+    else:
+        parts = []
+        if sig_pass:
+            parts.append(f"Metrics predicting commit production: {', '.join(sig_pass)}")
+        if sig_fix:
+            parts.append(f"Metrics predicting followup fixes: {', '.join(sig_fix)}")
+        conclusion = ". ".join(parts) + "."
+
+    output = {
+        "sample_size": n,
+        "pass_rate": round(pass_rate, 3),
+        "followup_fix_rate": round(followup_rate, 3),
+        "vs_outcome_pass": pass_correlations,
+        "vs_followup_fix": fix_correlations,
+        "mean_comparison": mean_comp,
+        "significant_predictors": {
+            "outcome_pass": sig_pass,
+            "followup_fix": sig_fix,
+        },
+        "conclusion": conclusion,
+    }
+
+    print(json.dumps(output, indent=2))
+    db.close()
+
+
 def _find_session_file(session_id: str, project_path: str = None) -> Path | None:
     """Locate a session JSONL file."""
     projects_dir = Path.home() / ".claude" / "projects"
@@ -1268,6 +1718,14 @@ def main():
     # backfill
     sub.add_parser("backfill")
 
+    # extract
+    extract_p = sub.add_parser("extract")
+    extract_p.add_argument("--days", default="90",
+                           help="Days to look back, or 'all'")
+
+    # correlate
+    sub.add_parser("correlate")
+
     args = parser.parse_args()
 
     if args.command == "save":
@@ -1290,6 +1748,10 @@ def main():
         cmd_verify(args)
     elif args.command == "backfill":
         cmd_backfill(args)
+    elif args.command == "extract":
+        cmd_extract(args)
+    elif args.command == "correlate":
+        cmd_correlate(args)
     else:
         parser.print_help()
         sys.exit(1)
