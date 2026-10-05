@@ -57,6 +57,35 @@ records a processed receipt.
 
 Ingestion can only create `Candidate`. AI normalization can shorten or clean a candidate, but it cannot set status. The MCP write tool requires a reason, and `Superseded` also requires the replacement memory ID.
 
+## Project matching
+
+`search_memory` and `list_memory_candidates` resolve project aliases before
+filtering rows. A scoped identity such as `apps/rally-hq` matches its paths under
+`~/Workspace/dev` on either Mac, including repository-local `.worktrees` paths.
+Home-directory names do not affect that identity. Codex-managed worktree roots
+and legacy short names resolve by repository name only when the stored scoped
+identity is unique. Dotfiles paths resolve to `.dotfiles`.
+
+If both `apps/demo` and `sites/demo` exist, `demo` returns an ambiguity error.
+An explicit `apps/demo` query excludes legacy `demo` rows because their owner
+cannot be established. All memory states participate in collision detection;
+changing approval status cannot silently merge projects.
+
+Project filters are exact after alias resolution. They no longer perform
+substring or SQL wildcard matching. Omit `project` for an all-project search;
+an empty or unknown project never broadens a query. Stored project values and
+provenance remain unchanged. Status filtering still happens before the result
+limit, and normal searches still default to `Approved`.
+
+This read-time resolver queries distinct stored project values, capped at 1,000.
+A larger catalog fails explicitly instead of guessing from a partial list.
+The cap bounds resolver input, not D1's scan cost. An indexed project registry
+is the next step if measured catalog size or lookup cost requires it.
+
+This is a naming convention, not proof of repository ownership. Two repositories
+with the same short name need scoped paths in their records. Arbitrary labels,
+URLs, and paths containing parent traversal do not receive basename aliases.
+
 ## Why these Cloudflare services
 
 - D1 is the primary store because relational provenance, state transitions, uniqueness, and FTS5 search matter more than semantic similarity at this stage.

@@ -104,5 +104,6 @@ Do not delete anything during field validation. The retention report always retu
 
 ## Current field runs
 
+- [Project aliases and lesson review — 2026-10-05](field-runs/2026-10-05-project-aliases.md): live retrieval defect reproduced, local fix tested, lesson drafts prepared; deployment, approval, and fresh-session behavior remain open.
 - [Machine A — 2026-08-03](field-runs/2026-08-03-machine-a.md): local baseline and retention receipt; multi-machine gate remains open.
 - [Machine B partial run — 2026-08-03](field-runs/2026-08-03-machine-b-bootstrap.md): portable labels and local staging measured; stopped before push on a privacy violation.
