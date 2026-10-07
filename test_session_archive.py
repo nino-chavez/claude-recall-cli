@@ -19,6 +19,7 @@ import io
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -211,6 +212,172 @@ class MissingKeyDetection(unittest.TestCase):
         self.assertFalse(sa._is_missing_key(self.cp(AUTH)))
         self.assertFalse(sa._is_missing_key(self.cp("fetch failed: ECONNRESET")))
         self.assertFalse(sa._is_missing_key(self.cp("wrangler timed out after 300s")))
+
+
+
+NOW = 1_800_000_000.0
+H = "/h"   # plan_pack is pure: paths only need to sit under sa.HOME
+
+
+def ago(days):
+    return NOW - days * 86400
+
+
+class SplitPackPlanner(unittest.TestCase):
+    """plan_pack against claude/2026-07 as measured 2026-10-06: 1,082 files,
+    543 within ten days of the 90-day deletion, one resumed session 10 days
+    old holding the whole month open."""
+
+    def setUp(self):
+        self.saved_home = sa.HOME
+        sa.HOME = H
+
+    def tearDown(self):
+        sa.HOME = self.saved_home
+
+    def plan(self, groups, objects=None, retention=90, lead=15, cutoff=45, exists=True):
+        return sa.plan_pack(groups, objects or {}, NOW, cutoff, lead,
+                            retention=lambda tree: retention if tree == "claude" else None,
+                            local_exists=lambda name: exists)
+
+    def files(self, *ages, month="2026-07"):
+        return [(f"{H}/.claude/projects/p/{month}-{i}.jsonl", ago(a)) for i, a in enumerate(ages)]
+
+    def obj(self, files, snapshot_days_ago, verified=True):
+        return {"tree": "claude", "month": "2026-07",
+                "members": [p[len(H) + 1:] for p, _ in files],
+                "snapshot_at": ago(snapshot_days_ago),
+                "packed": "2026-01-01T00:00:00+00:00",
+                "verified": "2026-01-01T00:00:00+00:00" if verified else None}
+
+    def test_fresh_cold_month_packs_whole_as_before(self):
+        f = self.files(50, 60)
+        [it] = self.plan({("codex-sessions", "2026-05"): f})
+        self.assertEqual(it["name"], "codex-sessions/2026-05.tar.zst")
+        self.assertEqual(it["paths"], sorted(p for p, _ in f))
+        self.assertEqual((it["reason"], it["held"]), ("month cold", 0))
+
+    def test_codex_month_with_a_hot_file_never_splits(self):
+        self.assertEqual(self.plan({("codex-sessions", "2026-07"): self.files(89, 1)}), [])
+
+    def test_split_packs_cold_files_and_holds_the_blocker(self):
+        f = self.files(89, 80, 50, 46, 10)
+        [it] = self.plan({("claude", "2026-07"): f})
+        self.assertEqual(it["name"], "claude/2026-07.tar.zst")
+        self.assertEqual(it["paths"], sorted(p for p, _ in f[:4]))
+        self.assertEqual(it["held"], 1)
+        self.assertTrue(it["reason"].startswith("split"))
+
+    def test_no_split_until_a_file_is_within_the_lead(self):
+        self.assertEqual(self.plan({("claude", "2026-08"): self.files(70, 50, 7)}), [])
+
+    def test_blocker_gets_part2_once_cold(self):
+        f = self.files(89, 80, 50, 46, 46)
+        base = self.obj(f[:4], snapshot_days_ago=30)
+        [it] = self.plan({("claude", "2026-07"): f}, {"claude/2026-07.tar.zst": base})
+        self.assertEqual(it["name"], "claude/2026-07.part2.tar.zst")
+        self.assertEqual(it["paths"], [f[4][0]])
+        self.assertEqual(it["reason"], "month cold")
+
+    def test_verified_unchanged_month_plans_nothing(self):
+        f = self.files(89, 80)
+        self.assertEqual(self.plan({("claude", "2026-07"): f},
+                                   {"claude/2026-07.tar.zst": self.obj(f, 60)}), [])
+
+    def test_member_written_after_its_snapshot_is_pending_again(self):
+        f = self.files(80, 50)   # the 50-day file was written after a 60-day-old snapshot
+        [it] = self.plan({("claude", "2026-07"): f},
+                         {"claude/2026-07.tar.zst": self.obj(f, 60)})
+        self.assertEqual(it["name"], "claude/2026-07.part2.tar.zst")
+        self.assertEqual(it["paths"], [f[1][0]])
+
+    def test_retention_shorter_than_cutoff_still_saves_files(self):
+        # cleanupPeriodDays at its 30-day default deletes files before they are
+        # 45 days cold; the at-risk floor has to win over the cutoff.
+        f = self.files(20, 16, 5)
+        [it] = self.plan({("claude", "2026-09"): f}, retention=30)
+        self.assertEqual(it["paths"], sorted(p for p, _ in f[:2]))
+        self.assertEqual(it["held"], 1)
+
+    def test_unverified_object_without_tarball_is_rebuilt_under_its_name(self):
+        f = self.files(80, 70)
+        base = self.obj(f, 60, verified=False)
+        [it] = self.plan({("claude", "2026-07"): f}, {"claude/2026-07.tar.zst": base}, exists=False)
+        self.assertEqual(it["name"], "claude/2026-07.tar.zst")
+        self.assertEqual(len(it["paths"]), 2)
+
+    def test_part_names(self):
+        self.assertEqual(sa.obj_name("claude", "2026-07", 3), "claude/2026-07.part3.tar.zst")
+        self.assertEqual(sa.part_of("claude/2026-07.part3.tar.zst"), 3)
+        self.assertEqual(sa.part_of("claude/2026-07.tar.zst"), 1)
+
+
+class RetentionDays(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = sa.CLAUDE_SETTINGS
+        sa.CLAUDE_SETTINGS = os.path.join(self.tmp.name, "settings.json")
+
+    def tearDown(self):
+        sa.CLAUDE_SETTINGS = self.saved
+        self.tmp.cleanup()
+
+    def test_reads_cleanup_period_days(self):
+        Path(sa.CLAUDE_SETTINGS).write_text('{"cleanupPeriodDays": 90}')
+        self.assertEqual(sa.retention_days("claude"), 90)
+
+    def test_defaults_to_claude_codes_30_when_unset_or_unreadable(self):
+        self.assertEqual(sa.retention_days("claude"), 30)
+        Path(sa.CLAUDE_SETTINGS).write_text("not json")
+        self.assertEqual(sa.retention_days("claude"), 30)
+
+    def test_codex_has_no_retention(self):
+        self.assertIsNone(sa.retention_days("codex-sessions"))
+
+
+class PruneKeepsFilesWrittenAfterPacking(ArchiveTestCase):
+    def setUp(self):
+        super().setUp()
+        self.d = Path(sa.HOME) / ".codex/sessions"
+        self.d.mkdir(parents=True)
+        self.snap = time.time() - 1000
+
+    def make(self, name, mtime):
+        p = self.d / name
+        p.write_text("{}\n")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def rel(self, p):
+        return os.path.relpath(p, sa.HOME)
+
+    def verified(self, members, snapshot):
+        return {"tree": "codex-sessions", "month": "2026-07", "members": members,
+                "snapshot_at": snapshot, "packed": "2026-01-01T00:00:00+00:00",
+                "pushed": "x", "verified": "x"}
+
+    def prune(self):
+        return self.run_cmd(lambda _: sa.cmd_prune(
+            argparse.Namespace(tree=None, yes=True)))
+
+    def test_file_written_after_snapshot_is_kept(self):
+        cold = self.make("cold.jsonl", self.snap - 100)
+        resumed = self.make("resumed.jsonl", self.snap + 100)
+        sa.save_state({"objects": {NAME: self.verified(
+            [self.rel(cold), self.rel(resumed)], self.snap)}})
+        _, out = self.prune()
+        self.assertFalse(cold.exists())
+        self.assertTrue(resumed.exists())
+        self.assertIn("written after they were packed", out)
+
+    def test_a_later_part_covering_the_new_lines_authorizes_deletion(self):
+        resumed = self.make("resumed.jsonl", self.snap + 100)
+        sa.save_state({"objects": {
+            NAME: self.verified([self.rel(resumed)], self.snap),
+            "codex-sessions/2026-07.part2.tar.zst": self.verified([self.rel(resumed)], self.snap + 500),
+        }})
+        self.prune()
+        self.assertFalse(resumed.exists())
 
 
 if __name__ == "__main__":
