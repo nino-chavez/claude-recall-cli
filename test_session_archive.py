@@ -158,11 +158,14 @@ class PushConfirmsBeforeMarking(ArchiveTestCase):
         put = next(c for c in self.r2.calls if c[0] == "put" and c[1].endswith(NAME))
         self.assertIsNotNone(put[2])
 
-    def test_missing_local_tarball_is_reported_not_crashed(self):
+    def test_missing_local_tarball_is_reported_without_failing_the_run(self):
+        # If the transcripts are gone too, nothing can rebuild the tarball. A
+        # failure here would stop every later run before verify and prune.
         os.remove(Path(sa.OUT) / NAME)
         rc, out = self.run_cmd(sa.cmd_push)
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
         self.assertIn("local tarball missing", out)
+        self.assertIsNone(self.obj()["pushed"])
 
 
 class VerifyClearsPushedOnlyWhenKeyIsAbsent(ArchiveTestCase):
