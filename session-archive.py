@@ -30,6 +30,11 @@ Design notes
   and, crucially, leaves a TOMBSTONE in archive-state.json: object name, month,
   member list, file/line counts and sha256 are kept forever. So "what did I
   work on in May 2026" stays answerable after the bytes are gone.
+* `pushed` means the object was read back from the remote with a matching
+  sha256, not that the upload command exited 0. A put exited 0 on 2026-09-21
+  without storing anything, and the stale flag blocked that month for weeks.
+  If verify later finds the key absent, it clears `pushed` so the next push
+  re-uploads; any other verify failure leaves the flag alone.
 * prune is gated on a passing verify recorded in the state file -- never on
   ingest watermarks. poe-extract's watermark proves ingestion by poe-extract;
   artifact-miner.py rglobs the whole corpus with no watermark at all, so
@@ -199,12 +204,15 @@ def _write_manifest(state):
                                 "member_count": len(o.get("members", []))}) + "\n")
     log(f"  manifest -> {mpath}")
 
-def _wrangler(bucket, *args):
+def _wrangler(bucket, *args, timeout=None):
     """R2 object ops via wrangler + the account-ops API token from 1Password.
 
     wrangler's own OAuth token has no R2 scope on this machine, so we inject
     CLOUDFLARE_API_TOKEN. The token value is read by op into this process's env
     and never written to disk.
+
+    A timeout comes back as returncode 124, not an exception, so callers treat
+    it like any other failed transfer.
     """
     env = dict(os.environ)
     if "CLOUDFLARE_API_TOKEN" not in env:
@@ -223,36 +231,112 @@ def _wrangler(bucket, *args):
             capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
             env["CLOUDFLARE_ACCOUNT_ID"] = r.stdout.strip()
-    return subprocess.run(["wrangler", "r2", "object", *args],
-                          capture_output=True, text=True, env=env)
+    try:
+        return subprocess.run(["wrangler", "r2", "object", *args],
+                              capture_output=True, text=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"wrangler timed out after {timeout}s")
 
 
-def _rclone(remote, *args):
-    return subprocess.run(["rclone", *args], capture_output=True, text=True)
+def _rclone(remote, *args, timeout=None):
+    try:
+        return subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"rclone timed out after {timeout}s")
+
+def _transfer_timeout(nbytes):
+    """Seconds allowed for one object transfer. The healthy 273 MB put of
+    claude/2026-06 took 40s; the 2026-09-21 put that silently stored nothing
+    sat for ten minutes and then exited 0. Generous, but bounded."""
+    return 300 + int(2 * nbytes / 1e6)
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# wrangler prints R2's NoSuchKey as "The specified key does not exist.", wrapped
+# in ANSI colour codes. Only this answer means "the object is not there"; auth or
+# network failures must not be mistaken for it, or a bad token would trigger a
+# re-upload of everything every week.
+_MISSING_KEY = ("the specified key does not exist", "nosuchkey")
+
+def _is_missing_key(r):
+    text = _ANSI.sub("", f"{r.stderr or ''}\n{r.stdout or ''}").lower()
+    return any(s in text for s in _MISSING_KEY)
+
+def _remote_get(args, name, td, nbytes):
+    """Download object `name` into directory td. -> (local_path, CompletedProcess)."""
+    local = os.path.join(td, os.path.basename(name))
+    if args.bucket:
+        r = _wrangler(args.bucket, "get", f"{args.bucket}/{name}", f"--file={local}", "--remote",
+                      timeout=_transfer_timeout(nbytes))
+    else:
+        r = _rclone(args.remote, "copy", f"{args.remote}/{name}", td,
+                    timeout=_transfer_timeout(nbytes))
+    return local, r
+
+def _confirm_in_remote(args, name, o):
+    """-> (ok, reason). The object exists in the remote and its sha256 matches.
+
+    An exit code of 0 from the upload is not evidence the object landed: the
+    2026-09-21 put of codex-sessions/2026-07 exited 0, its wrangler log stopped
+    at "Creating object", and R2 never had the key. wrangler has no `head`, so
+    this is a full get. A failed get still leaves a 0-byte file, which is why the
+    check is the hash and not the file's existence.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        local, r = _remote_get(args, name, td, o.get("archive_bytes") or 0)
+        if r.returncode != 0:
+            why = "not in remote" if _is_missing_key(r) else "read-back failed"
+            return False, f"{why}: {_ANSI.sub('', (r.stderr or r.stdout or '').strip())[:200]}"
+        if not os.path.exists(local) or os.path.getsize(local) == 0:
+            return False, "read-back produced no bytes"
+        got = sha256(local)
+        if got != o["sha256"]:
+            return False, f"read-back sha256 {got[:16]} != {o['sha256'][:16]}"
+    return True, "sha256 matches"
 
 def cmd_push(args):
-    if not shutil.which("rclone"): log("rclone not found"); return 1
+    tool = "wrangler" if args.bucket else "rclone"
+    if not shutil.which(tool): log(f"{tool} not found"); return 1
     state = load_state()
     todo = [n for n, o in state["objects"].items() if o.get("packed") and not o.get("pushed")]
     if not todo: log("  nothing packed-and-unpushed"); return 0
+    ok_all = True
     for name in sorted(todo):
+        o = state["objects"][name]
         src = os.path.join(OUT, name)
+        if not os.path.exists(src):
+            # pushed can now be cleared after the local tarball was removed. pack
+            # runs first and rebuilds it while the transcripts survive; if they
+            # are gone too (cleanupPeriodDays), nothing can ever re-send it.
+            # Counting that as a failure would stop every later run before
+            # verify and prune, so it is reported, not failed.
+            log(f"  push {name}: SKIPPED -- local tarball missing and pack did not rebuild it; "
+                f"if its transcripts are gone, this object cannot be re-sent")
+            continue
+        size = os.path.getsize(src)
         if args.bucket:
-            log(f"  push {name} -> r2://{args.bucket}/{name}  ({os.path.getsize(src)/1e6:.1f} MB)")
-            r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote")
+            log(f"  push {name} -> r2://{args.bucket}/{name}  ({size/1e6:.1f} MB)")
+            r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote",
+                          timeout=_transfer_timeout(size))
         else:
             dst = f"{args.remote}/{os.path.dirname(name)}"
             log(f"  push {name} -> {dst}")
-            r = _rclone(args.remote, "copy", src, dst, "--progress", "--s3-chunk-size", "64M")
+            r = _rclone(args.remote, "copy", src, dst, "--progress", "--s3-chunk-size", "64M",
+                        timeout=_transfer_timeout(size))
         if r.returncode != 0:
-            log(f"    FAILED: {(r.stderr or r.stdout)[:300]}"); continue
-        state["objects"][name]["pushed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            log(f"    FAILED: {(r.stderr or r.stdout)[:300]}"); ok_all = False; continue
+        ok, why = _confirm_in_remote(args, name, o)
+        if not ok:
+            log(f"    FAILED confirm after upload ({why}) -- not marking pushed")
+            ok_all = False; continue
+        log(f"    confirmed in remote ({why})")
+        o["pushed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         save_state(state)
     for f in ("MANIFEST.jsonl", "archive-state.json"):
         src = os.path.join(OUT, f)
-        if args.bucket: _wrangler(args.bucket, "put", f"{args.bucket}/{f}", f"--file={src}", "--remote")
-        else: _rclone(args.remote, "copy", src, args.remote)
-    return 0
+        if args.bucket: _wrangler(args.bucket, "put", f"{args.bucket}/{f}", f"--file={src}", "--remote",
+                                  timeout=_transfer_timeout(os.path.getsize(src) if os.path.exists(src) else 0))
+        else: _rclone(args.remote, "copy", src, args.remote, timeout=600)
+    return 0 if ok_all else 1
 
 def cmd_verify(args):
     """Pull each pushed object back down; check sha256, then extract and diff
@@ -265,13 +349,19 @@ def cmd_verify(args):
         o = state["objects"][name]
         log(f"  verify {name}")
         with tempfile.TemporaryDirectory() as td:
-            local = os.path.join(td, os.path.basename(name))
-            if args.bucket:
-                r = _wrangler(args.bucket, "get", f"{args.bucket}/{name}", f"--file={local}", "--remote")
-            else:
-                r = _rclone(args.remote, "copy", f"{args.remote}/{name}", td)
+            local, r = _remote_get(args, name, td, o.get("archive_bytes") or 0)
             if r.returncode != 0 or not os.path.exists(local):
-                log(f"    FAILED download: {(r.stderr or r.stdout)[:200]}"); ok_all = False; continue
+                log(f"    FAILED download: {(r.stderr or r.stdout)[:200]}"); ok_all = False
+                if _is_missing_key(r):
+                    # The remote says the key is absent, so `pushed` is false.
+                    # Left set, push skips this object forever and verify fails
+                    # forever (codex-sessions/2026-07, 2026-09-21 onward). Clear
+                    # it so the next push re-uploads. Any other failure (auth,
+                    # network) leaves `pushed` alone.
+                    o["pushed"] = None
+                    save_state(state)
+                    log(f"    key absent in remote -- cleared 'pushed'; next push re-uploads it")
+                continue
             got = sha256(local)
             if got != o["sha256"]:
                 log(f"    FAILED sha256: {got[:16]} != {o['sha256'][:16]}"); ok_all = False; continue
