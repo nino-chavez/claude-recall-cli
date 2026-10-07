@@ -186,7 +186,7 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
     for (tree, mo), files in sorted(groups.items()):
         mine = {n: o for n, o in objects.items() if o.get("tree") == tree and o.get("month") == mo}
         # Packed but never verified, and the local tarball is gone: nothing can
-        # push it, so it is rebuilt under the same name.
+        # push it, so it is rebuilt under its own name (below).
         rebuild = sorted(n for n, o in mine.items() if not o.get("verified") and not local_exists(n))
         covered = {}
         for n, o in mine.items():
@@ -198,6 +198,16 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
         for p, m in files:
             c = covered.get(os.path.relpath(p, HOME))
             if c is None or m >= c: pending.append((p, m))
+        # Each lost object is rebuilt from its own surviving members, so no
+        # name is left in state with nothing able to recreate its tarball.
+        for n in rebuild:
+            own = set(mine[n].get("members", []))
+            mem = [(p, m) for p, m in pending if os.path.relpath(p, HOME) in own]
+            if not mem: continue
+            out.append({"name": n, "tree": tree, "month": mo,
+                        "paths": sorted(p for p, _ in mem),
+                        "reason": "rebuild: never verified, local tarball gone", "held": 0})
+            pending = [pm for pm in pending if pm not in mem]
         if not pending: continue
         age = lambda m: (now - m) / 86400
         if all(age(m) >= cutoff_days for _, m in pending):
@@ -212,8 +222,7 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
             pick = [(p, m) for p, m in pending if age(m) >= floor]
             reason = (f"split: oldest pending file {oldest:.0f}d old, "
                       f"{tree} deletes at {ret}d")
-        if rebuild: name = rebuild[0]
-        elif not mine: name = obj_name(tree, mo)
+        if not mine: name = obj_name(tree, mo)
         else: name = obj_name(tree, mo, max(part_of(n) for n in mine) + 1)
         out.append({"name": name, "tree": tree, "month": mo,
                     "paths": sorted(p for p, _ in pick), "reason": reason,
@@ -472,23 +481,32 @@ def cmd_verify(args):
             with open(tp, "wb") as f: f.write(d.stdout)
             with tarfile.open(tp) as tf: tf.extractall(ex, filter="data")
             members = sorted(m for m in o["members"])
-            bad = 0; checked = 0; lines = 0
+            bad = 0; checked = 0; lines = 0; changed = 0
+            snap = snapshot_epoch(o)
             for rel in members:
                 x = os.path.join(ex, rel)
                 if not os.path.exists(x):
                     log(f"    MISSING in archive: {rel}"); bad += 1; continue
                 lines += count_lines(x)
                 loc = os.path.join(HOME, rel)
-                if os.path.exists(loc):
-                    checked += 1
-                    if sha256(x) != sha256(loc):
-                        log(f"    CONTENT MISMATCH: {rel}"); bad += 1
+                try: m = os.path.getmtime(loc)
+                except OSError: continue
+                if m >= snap:
+                    # Written since the snapshot (a resumed session): the local
+                    # file is ahead of the archive by design, and a later part
+                    # carries the new lines. sha256 + line count still prove
+                    # the object intact; byte-comparing would fail forever.
+                    changed += 1; continue
+                checked += 1
+                if sha256(x) != sha256(loc):
+                    log(f"    CONTENT MISMATCH: {rel}"); bad += 1
             if lines != o["line_count"]:
                 log(f"    LINE COUNT MISMATCH: {lines:,} != {o['line_count']:,}"); bad += 1
             if bad:
                 log(f"    FAILED ({bad} problems)"); ok_all = False; continue
+            later = f", {changed} written since pack (not compared)" if changed else ""
             log(f"    restored {len(members)} members, {lines:,} lines, "
-                f"{checked} byte-compared against local -- OK")
+                f"{checked} byte-compared against local{later} -- OK")
             state["objects"][name]["verified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             save_state(state)
     return 0 if ok_all else 1

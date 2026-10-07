@@ -17,7 +17,9 @@ import hashlib
 import importlib.util
 import io
 import os
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -309,6 +311,17 @@ class SplitPackPlanner(unittest.TestCase):
         self.assertEqual(it["name"], "claude/2026-07.tar.zst")
         self.assertEqual(len(it["paths"]), 2)
 
+    def test_every_lost_unverified_object_is_rebuilt_from_its_own_members(self):
+        f = self.files(89, 85, 80)
+        base = self.obj(f[:2], 60, verified=False)
+        part2 = dict(self.obj(f[2:], 50, verified=False))
+        plan = self.plan({("claude", "2026-07"): f},
+                         {"claude/2026-07.tar.zst": base, "claude/2026-07.part2.tar.zst": part2},
+                         exists=False)
+        got = {it["name"]: it["paths"] for it in plan}
+        self.assertEqual(got, {"claude/2026-07.tar.zst": sorted(p for p, _ in f[:2]),
+                               "claude/2026-07.part2.tar.zst": [f[2][0]]})
+
     def test_part_names(self):
         self.assertEqual(sa.obj_name("claude", "2026-07", 3), "claude/2026-07.part3.tar.zst")
         self.assertEqual(sa.part_of("claude/2026-07.part3.tar.zst"), 3)
@@ -381,6 +394,45 @@ class PruneKeepsFilesWrittenAfterPacking(ArchiveTestCase):
         }})
         self.prune()
         self.assertFalse(resumed.exists())
+
+
+
+@unittest.skipUnless(shutil.which("zstd"), "zstd not installed")
+class VerifyToleratesFilesWrittenSincePack(ArchiveTestCase):
+    def setUp(self):
+        super().setUp()
+        self.member = Path(sa.HOME) / ".claude/projects/p/s.jsonl"
+        self.member.parent.mkdir(parents=True)
+        self.member.write_text('{"a": 1}\n{"a": 2}\n')
+        rel = os.path.relpath(self.member, sa.HOME)
+        tarpath = Path(self.tmp.name) / "a.tar"
+        with tarfile.open(tarpath, "w") as tf:
+            tf.add(self.member, arcname=rel)
+        blob = subprocess.run(["zstd", "-q", "-c", str(tarpath)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=60, check=True).stdout
+        self.snap = time.time()
+        self.r2.objects[NAME] = blob
+        sa.save_state({"objects": {NAME: {
+            "tree": "claude", "month": "2026-07", "members": [rel], "file_count": 1,
+            "line_count": 2, "archive_bytes": len(blob),
+            "sha256": hashlib.sha256(blob).hexdigest(), "snapshot_at": self.snap,
+            "packed": "2026-10-06T00:00:00+00:00", "pushed": "x", "verified": None}}})
+
+    def test_member_resumed_after_pack_still_verifies(self):
+        with open(self.member, "a") as f: f.write('{"a": 3}\n')
+        os.utime(self.member, (self.snap + 60, self.snap + 60))
+        rc, out = self.run_cmd(sa.cmd_verify)
+        self.assertEqual(rc, 0, out)
+        self.assertIsNotNone(self.obj()["verified"])
+        self.assertIn("1 written since pack", out)
+
+    def test_unchanged_member_with_different_bytes_still_fails(self):
+        # Negative control: the byte-compare must still catch a real mismatch.
+        self.member.write_text('{"a": 9}\n{"a": 2}\n')
+        os.utime(self.member, (self.snap - 60, self.snap - 60))
+        rc, out = self.run_cmd(sa.cmd_verify)
+        self.assertEqual(rc, 1)
+        self.assertIn("CONTENT MISMATCH", out)
 
 
 if __name__ == "__main__":
