@@ -41,6 +41,7 @@ jobs:
           test_context_plane.py
           test_cross_client_transcripts.py
           test_prompt_hook_recency.py
+          test_session_archive.py
 
   worker:
     name: Cloudflare Worker
