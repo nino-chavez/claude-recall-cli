@@ -16,8 +16,14 @@ Design notes
 ------------
 * Grouped by the month of each file's FIRST record timestamp, not mtime --
   mtime is when a session was last appended, which is not when the work happened.
-* A month is eligible only when EVERY file in it is older than --cutoff-days.
-  Partial months are never split, so an object is always a complete month.
+* A month packs whole once EVERY file in it is older than --cutoff-days. It
+  packs early, in parts, when waiting would lose files: Claude Code deletes a
+  transcript cleanupPeriodDays after its last write, so a single resumed
+  session used to hold its month open while the rest of the month was deleted
+  (claude/2026-07). Once a pending file is within --split-lead-days of that
+  deletion, the cold files go into the month's object and the rest wait for
+  <month>.part2.tar.zst. A file written after its object was packed becomes
+  pending again, so a later part carries the new lines. See plan_pack().
 * Compression is plain `zstd -19` on a solid tar. Measured on this corpus:
   per-file 3.6x, solid 4.1x, --long=31 4.1x, -22 --ultra 4.2x. Window tuning
   and --ultra buy nothing, so they are not used.
@@ -41,7 +47,7 @@ Design notes
   watermark coverage does not mean a file is finished being read.
 """
 from __future__ import annotations
-import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
+import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -53,6 +59,9 @@ TREES = {
 }
 OUT   = os.path.expanduser("~/.claude/archived_sessions")
 STATE = os.path.join(OUT, "archive-state.json")
+CLAUDE_SETTINGS = "~/.claude/settings.json"
+CLAUDE_DEFAULT_CLEANUP_DAYS = 30   # Claude Code's own default when cleanupPeriodDays is unset
+WRANGLER_MAX_BYTES = 315 * 1000 * 1000
 TS    = re.compile(r'"timestamp":\s*"(\d{4})-(\d{2})')
 
 def log(m): print(m, flush=True)
@@ -105,11 +114,9 @@ def count_lines(path):
         for _ in f: n += 1
     return n
 
-def survey(cutoff_days):
-    """-> {(tree, month): [paths]} for months fully older than the cutoff."""
-    now = datetime.now(timezone.utc).timestamp()
-    cutoff = now - cutoff_days * 86400
-    groups, newest = defaultdict(list), defaultdict(float)
+def survey():
+    """-> {(tree, month): [(path, mtime)]} for every transcript on disk."""
+    groups = defaultdict(list)
     fallback = []
     for tree, root in TREES.items():
         root = os.path.expanduser(root)
@@ -119,29 +126,129 @@ def survey(cutoff_days):
             if not mo:
                 fallback.append((p, "unreadable")); continue
             if src == "mtime": fallback.append((p, "mtime"))
-            k = (tree, mo)
-            groups[k].append(p)
-            newest[k] = max(newest[k], os.path.getmtime(p))
+            try: groups[(tree, mo)].append((p, os.path.getmtime(p)))
+            except OSError: continue
     survey.last_fallback = fallback
-    return {k: sorted(v) for k, v in groups.items() if newest[k] < cutoff}
+    return {k: sorted(v) for k, v in groups.items()}
 
-def obj_name(tree, month): return f"{tree}/{month}.tar.zst"
+def retention_days(tree):
+    """Days after its last write that the owning client deletes a transcript.
+    None means nothing ever deletes it (Codex has no retention of any kind)."""
+    if tree != "claude": return None
+    try:
+        with open(os.path.expanduser(CLAUDE_SETTINGS)) as f:
+            v = json.load(f).get("cleanupPeriodDays")
+    except (OSError, ValueError, AttributeError):
+        v = None
+    return v if isinstance(v, int) and v > 0 else CLAUDE_DEFAULT_CLEANUP_DAYS
+
+_PART = re.compile(r"\.part(\d+)\.tar\.zst$")
+
+def obj_name(tree, month, part=1):
+    return f"{tree}/{month}.tar.zst" if part == 1 else f"{tree}/{month}.part{part}.tar.zst"
+
+def part_of(name):
+    m = _PART.search(name)
+    return int(m.group(1)) if m else 1
+
+def snapshot_epoch(o):
+    """When an object's members were read. A member modified at or after this
+    holds lines the object does not. Objects packed before snapshot_at existed
+    fall back to `packed`, which is later than the read, so for them this errs
+    toward calling a file unchanged; their members were all >45 days cold."""
+    if o.get("snapshot_at") is not None: return float(o["snapshot_at"])
+    if o.get("packed"): return datetime.fromisoformat(o["packed"]).timestamp()
+    return 0.0
+
+def plan_pack(groups, objects, now, cutoff_days, lead_days,
+              retention=retention_days, local_exists=None):
+    """-> [{name, tree, month, paths, reason, held}] for the objects pack should build.
+
+    A file is covered when some object of its month lists it and the file has
+    not been written since that object's snapshot. Everything else is pending.
+
+    * Month cold: every pending file is older than cutoff_days. Pack them all.
+      For a month never packed before, this is the original whole-month rule.
+    * Split: the tree has a deletion clock and a pending file is within
+      lead_days of it. Pack the pending files old enough to be at risk or cold,
+      and hold the rest for a later part. Without this, one resumed session
+      keeps its month from ever packing while the client deletes the rest of
+      the month around it (claude/2026-07: 167 files gone unarchived by
+      2026-10-06, blocked by a single 0.2 MB file).
+
+    The first object of a month keeps the plain name; later ones are
+    <month>.part2.tar.zst, .part3, ... each with its own members, sha256 and
+    verify. Rotation keys on `month`, so parts age out with their month.
+    """
+    if local_exists is None:
+        local_exists = lambda n: os.path.exists(os.path.join(OUT, n))
+    out = []
+    for (tree, mo), files in sorted(groups.items()):
+        mine = {n: o for n, o in objects.items() if o.get("tree") == tree and o.get("month") == mo}
+        # Packed but never verified, and the local tarball is gone: nothing can
+        # push it, so it is rebuilt under its own name (below).
+        rebuild = sorted(n for n, o in mine.items() if not o.get("verified") and not local_exists(n))
+        covered = {}
+        for n, o in mine.items():
+            if n in rebuild: continue
+            snap = snapshot_epoch(o)
+            for rel in o.get("members", []):
+                covered[rel] = max(covered.get(rel, 0.0), snap)
+        pending = []
+        for p, m in files:
+            c = covered.get(os.path.relpath(p, HOME))
+            if c is None or m >= c: pending.append((p, m))
+        # Each lost object is rebuilt from its own surviving members, so no
+        # name is left in state with nothing able to recreate its tarball.
+        for n in rebuild:
+            own = set(mine[n].get("members", []))
+            mem = [(p, m) for p, m in pending if os.path.relpath(p, HOME) in own]
+            if not mem: continue
+            out.append({"name": n, "tree": tree, "month": mo,
+                        "paths": sorted(p for p, _ in mem),
+                        "reason": "rebuild: never verified, local tarball gone", "held": 0})
+            pending = [pm for pm in pending if pm not in mem]
+        if not pending: continue
+        age = lambda m: (now - m) / 86400
+        if all(age(m) >= cutoff_days for _, m in pending):
+            pick, reason = pending, "month cold"
+        else:
+            ret = retention(tree)
+            if ret is None: continue
+            at_risk = ret - lead_days
+            oldest = max(age(m) for _, m in pending)
+            if oldest < at_risk: continue
+            floor = min(cutoff_days, at_risk)
+            pick = [(p, m) for p, m in pending if age(m) >= floor]
+            reason = (f"split: oldest pending file {oldest:.0f}d old, "
+                      f"{tree} deletes at {ret}d")
+        if not mine: name = obj_name(tree, mo)
+        else: name = obj_name(tree, mo, max(part_of(n) for n in mine) + 1)
+        out.append({"name": name, "tree": tree, "month": mo,
+                    "paths": sorted(p for p, _ in pick), "reason": reason,
+                    "held": len(pending) - len(pick)})
+    return out
 
 def cmd_plan(args):
-    groups = survey(args.cutoff_days)
     state = load_state()
-    if not groups:
-        log(f"Nothing older than {args.cutoff_days} days. Nothing to archive."); return 0
+    planned = plan_pack(survey(), state["objects"], time.time(),
+                        args.cutoff_days, args.split_lead_days)
+    waiting = sorted(n for n, o in state["objects"].items()
+                     if o.get("packed") and not o.get("verified"))
+    if not planned and not waiting:
+        log(f"Nothing to pack, nothing awaiting push or verify."); return 0
     tot_raw = tot_files = 0
-    log(f"{'object':34} {'files':>6} {'raw':>9} {'est @4.1x':>10}  status")
-    for (tree, mo), paths in sorted(groups.items()):
-        raw = sum(os.path.getsize(p) for p in paths)
-        tot_raw += raw; tot_files += len(paths)
-        st = state["objects"].get(obj_name(tree, mo), {})
-        mark = "verified" if st.get("verified") else ("pushed" if st.get("pushed") else
-               ("packed" if st.get("packed") else "new"))
-        log(f"  {obj_name(tree,mo):32} {len(paths):>6} {raw/1e9:>8.2f}G {raw/4.1/1e9:>9.2f}G  {mark}")
-    log(f"\n  TOTAL {tot_files:,} files  {tot_raw/1e9:.2f} GB raw  ~{tot_raw/4.1/1e9:.2f} GB archived")
+    log(f"{'object':38} {'files':>6} {'raw':>9} {'est @4.1x':>10}  why")
+    for it in planned:
+        raw = sum(os.path.getsize(p) for p in it["paths"])
+        tot_raw += raw; tot_files += len(it["paths"])
+        held = f"; {it['held']} held for a later part" if it["held"] else ""
+        log(f"  {it['name']:36} {len(it['paths']):>6} {raw/1e9:>8.2f}G "
+            f"{raw/4.1/1e9:>9.2f}G  {it['reason']}{held}")
+    for n in waiting:
+        o = state["objects"][n]
+        log(f"  {n:36} {o.get('file_count', 0):>6}  awaiting {'verify' if o.get('pushed') else 'push'}")
+    log(f"\n  TO PACK {tot_files:,} files  {tot_raw/1e9:.2f} GB raw  ~{tot_raw/4.1/1e9:.2f} GB archived")
     fb = getattr(survey, "last_fallback", [])
     if fb:
         n_m = sum(1 for _, k in fb if k == "mtime")
@@ -154,24 +261,22 @@ def cmd_plan(args):
 def cmd_pack(args):
     if not shutil.which("zstd"):
         log("zstd not found -- brew install zstd"); return 1
-    groups = survey(args.cutoff_days)
     state = load_state()
     os.makedirs(OUT, exist_ok=True)
-    for (tree, mo), paths in sorted(groups.items()):
-        name = obj_name(tree, mo)
+    # Verified objects stay covered after their local tarball is deleted, so
+    # reclaiming disk never causes a re-pack and re-upload.
+    planned = plan_pack(survey(), state["objects"], time.time(),
+                        args.cutoff_days, args.split_lead_days)
+    if not planned: log("  nothing to pack")
+    for it in planned:
+        name, tree, mo, paths = it["name"], it["tree"], it["month"], it["paths"]
         dest = os.path.join(OUT, name)
-        prior = state["objects"].get(name, {})
-        if prior.get("verified"):
-            # Verified in the remote. The local tarball is a disposable cache --
-            # deleting it to reclaim disk must NOT cause a re-pack and re-upload
-            # on every subsequent run.
-            log(f"  skip (verified in remote) {name}"); continue
-        if prior.get("packed") and os.path.exists(dest):
-            log(f"  skip (packed) {name}"); continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
+        snapshot = time.time()  # before any member is read
         raw = sum(os.path.getsize(p) for p in paths)
         lines = sum(count_lines(p) for p in paths)
-        log(f"  packing {name}: {len(paths)} files, {raw/1e9:.2f} GB ...")
+        held = f", {it['held']} held for a later part" if it["held"] else ""
+        log(f"  packing {name}: {len(paths)} files, {raw/1e9:.2f} GB ({it['reason']}{held}) ...")
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as t: tarpath = t.name
         try:
             with tarfile.open(tarpath, "w") as tf:
@@ -189,6 +294,7 @@ def cmd_pack(args):
             "file_count": len(paths), "raw_bytes": raw, "line_count": lines,
             "archive_bytes": size, "sha256": digest,
             "packed": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "snapshot_at": round(snapshot, 3), "reason": it["reason"],
             "pushed": None, "verified": None,
         }
         save_state(state)
@@ -313,6 +419,9 @@ def cmd_push(args):
                 f"if its transcripts are gone, this object cannot be re-sent")
             continue
         size = os.path.getsize(src)
+        if args.bucket and size >= WRANGLER_MAX_BYTES:
+            log(f"  push {name}: {size/1e6:.0f} MB is over wrangler's 315 MB object limit -- "
+                f"push it with --remote (rclone) instead"); ok_all = False; continue
         if args.bucket:
             log(f"  push {name} -> r2://{args.bucket}/{name}  ({size/1e6:.1f} MB)")
             r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote",
@@ -372,23 +481,32 @@ def cmd_verify(args):
             with open(tp, "wb") as f: f.write(d.stdout)
             with tarfile.open(tp) as tf: tf.extractall(ex, filter="data")
             members = sorted(m for m in o["members"])
-            bad = 0; checked = 0; lines = 0
+            bad = 0; checked = 0; lines = 0; changed = 0
+            snap = snapshot_epoch(o)
             for rel in members:
                 x = os.path.join(ex, rel)
                 if not os.path.exists(x):
                     log(f"    MISSING in archive: {rel}"); bad += 1; continue
                 lines += count_lines(x)
                 loc = os.path.join(HOME, rel)
-                if os.path.exists(loc):
-                    checked += 1
-                    if sha256(x) != sha256(loc):
-                        log(f"    CONTENT MISMATCH: {rel}"); bad += 1
+                try: m = os.path.getmtime(loc)
+                except OSError: continue
+                if m >= snap:
+                    # Written since the snapshot (a resumed session): the local
+                    # file is ahead of the archive by design, and a later part
+                    # carries the new lines. sha256 + line count still prove
+                    # the object intact; byte-comparing would fail forever.
+                    changed += 1; continue
+                checked += 1
+                if sha256(x) != sha256(loc):
+                    log(f"    CONTENT MISMATCH: {rel}"); bad += 1
             if lines != o["line_count"]:
                 log(f"    LINE COUNT MISMATCH: {lines:,} != {o['line_count']:,}"); bad += 1
             if bad:
                 log(f"    FAILED ({bad} problems)"); ok_all = False; continue
+            later = f", {changed} written since pack (not compared)" if changed else ""
             log(f"    restored {len(members)} members, {lines:,} lines, "
-                f"{checked} byte-compared against local -- OK")
+                f"{checked} byte-compared against local{later} -- OK")
             state["objects"][name]["verified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             save_state(state)
     return 0 if ok_all else 1
@@ -408,13 +526,25 @@ def cmd_prune(args):
         ready = {n: o for n, o in ready.items() if o.get("tree") in args.tree}
         log(f"  scoped to tree(s): {', '.join(args.tree)}")
     if not ready: log("  nothing verified in scope -- refusing to delete anything"); return 0
-    victims = []
+    # A file written after its object's snapshot holds lines no verified object
+    # has (a resumed session). Only an object whose snapshot postdates the
+    # file's last write may authorize deleting it.
+    authorized, changed = {}, set()
     for n, o in ready.items():
+        snap = snapshot_epoch(o)
         for rel in o["members"]:
             p = os.path.join(HOME, rel)
-            if os.path.exists(p): victims.append((n, p, os.path.getsize(p)))
+            try: m = os.path.getmtime(p)
+            except OSError: continue
+            if m < snap: authorized[p] = n
+            else: changed.add(p)
+    changed -= set(authorized)
+    victims = [(n, p, os.path.getsize(p)) for p, n in sorted(authorized.items())]
     tot = sum(v[2] for v in victims)
     log(f"  {len(victims):,} local files covered by {len(ready)} VERIFIED objects, {tot/1e9:.2f} GB")
+    if changed:
+        log(f"  {len(changed):,} file(s) written after they were packed -- kept until a "
+            f"later part holding the new lines is verified")
     if not args.yes:
         log("  dry run. re-run with --yes to delete."); return 0
     removed = 0
@@ -473,7 +603,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", nargs="?", default="plan",
                     choices=["plan", "pack", "push", "verify", "prune", "rotate"])
-    ap.add_argument("--cutoff-days", type=int, default=45)
+    ap.add_argument("--cutoff-days", type=int, default=45,
+                    help="a file is cold once untouched this many days")
+    ap.add_argument("--split-lead-days", type=int, default=15,
+                    help="pack a month's cold files early once a pending file is within "
+                         "this many days of its client deleting it (claude: cleanupPeriodDays)")
     ap.add_argument("--remote", default=os.environ.get("SESSION_ARCHIVE_REMOTE", ""))
     ap.add_argument("--bucket", default=os.environ.get("SESSION_ARCHIVE_BUCKET", ""),
                     help="R2 bucket name; uses wrangler instead of rclone "
