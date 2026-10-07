@@ -402,8 +402,13 @@ def cmd_push(args):
         src = os.path.join(OUT, name)
         if not os.path.exists(src):
             # pushed can now be cleared after the local tarball was removed. pack
-            # re-creates it on the next run; nothing to send until then.
-            log(f"  push {name}: local tarball missing -- run pack first"); ok_all = False; continue
+            # runs first and rebuilds it while the transcripts survive; if they
+            # are gone too (cleanupPeriodDays), nothing can ever re-send it.
+            # Counting that as a failure would stop every later run before
+            # verify and prune, so it is reported, not failed.
+            log(f"  push {name}: SKIPPED -- local tarball missing and pack did not rebuild it; "
+                f"if its transcripts are gone, this object cannot be re-sent")
+            continue
         size = os.path.getsize(src)
         if args.bucket and size >= WRANGLER_MAX_BYTES:
             log(f"  push {name}: {size/1e6:.0f} MB is over wrangler's 315 MB object limit -- "
