@@ -25,10 +25,12 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -246,6 +248,58 @@ class TransportRule(unittest.TestCase):
     def test_one_given_is_used_whatever_the_size(self):
         self.assertEqual(sa._transport(self.ns(remote=""), 10**10), "wrangler")
         self.assertEqual(sa._transport(self.ns(bucket=""), 0), "rclone")
+
+
+class BothTransportsMustNameOneBucket(unittest.TestCase):
+    """Commit review 2026-10-08: with both flags, objects split by size, so a
+    --remote naming another bucket or a crypt remote would send small objects
+    (unencrypted, via wrangler) and large ones to different places."""
+
+    def test_same_bucket_rule(self):
+        self.assertTrue(sa._same_bucket("r2:claude-session-archive", "claude-session-archive"))
+        self.assertTrue(sa._same_bucket("r2:/claude-session-archive/", "claude-session-archive"))
+        self.assertFalse(sa._same_bucket("r2:other-bucket", "claude-session-archive"))
+        self.assertFalse(sa._same_bucket("r2crypt:", "claude-session-archive"))
+        self.assertFalse(sa._same_bucket("claude-session-archive", "claude-session-archive"))
+
+    def run_main(self, *argv):
+        out, saved = io.StringIO(), sys.argv
+        sys.argv = ["session-archive.py", *argv]
+        calls = []
+        saved_push, saved_verify = sa.cmd_push, sa.cmd_verify
+        sa.cmd_push = sa.cmd_verify = lambda a: calls.append(a) or 0
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SESSION_ARCHIVE_BUCKET", "SESSION_ARCHIVE_REMOTE")}
+        try:
+            with redirect_stdout(out), mock.patch.dict(os.environ, env, clear=True):
+                rc = sa.main()
+        finally:
+            sys.argv, sa.cmd_push, sa.cmd_verify = saved, saved_push, saved_verify
+        return rc, out.getvalue(), calls
+
+    def test_matching_pair_proceeds(self):
+        for cmd in ("push", "verify"):
+            rc, _, calls = self.run_main(cmd, "--bucket", "b1", "--remote", "r2:b1")
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1)
+
+    def test_other_bucket_is_refused_before_any_transfer(self):
+        for cmd in ("push", "verify"):
+            rc, out, calls = self.run_main(cmd, "--bucket", "b1", "--remote", "r2:b2")
+            self.assertEqual(rc, 2)
+            self.assertEqual(calls, [])
+            self.assertIn("must name the same R2 bucket", out)
+
+    def test_crypt_remote_with_bucket_is_refused(self):
+        rc, out, calls = self.run_main("push", "--bucket", "b1", "--remote", "r2crypt:")
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [])
+        self.assertIn("pass --remote alone", out)
+
+    def test_crypt_remote_alone_is_allowed(self):
+        rc, _, calls = self.run_main("push", "--remote", "r2crypt:")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
 
 
 class TransportChosenBySize(ArchiveTestCase):

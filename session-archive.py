@@ -38,9 +38,12 @@ Design notes
   bucket-only stalled the weekly cycle at push from 2026-10-08
   (codex-archived/2026-08, 906 MB), and verify and prune never ran. Given
   --bucket alone, an oversized object is refused with a message naming
-  --remote rather than attempted. See _transport().
-* Encryption is NOT handled here. Point --remote at an `rclone crypt` remote
-  wrapping R2; rclone encrypts the finished tarball on upload.
+  --remote rather than attempted. See _transport(). With both, --remote must
+  be a plain remote on the same bucket (`r2:BUCKET`); main() refuses anything
+  else, because objects split by size would land in two places.
+* Encryption is NOT handled here. Point --remote, given alone, at an `rclone
+  crypt` remote wrapping R2; rclone encrypts the finished tarball on upload.
+  wrangler cannot encrypt, so --bucket and a crypt remote are refused together.
 * Rotation has two halves. The authoritative one is server-side: an R2 bucket
   lifecycle rule (`wrangler r2 bucket lifecycle add <bucket> expire-12mo
   --expire-days 365`) expires objects without anything having to run locally.
@@ -376,6 +379,19 @@ def _transport(args, nbytes):
         return "wrangler" if nbytes < WRANGLER_MAX_BYTES else "rclone"
     return "wrangler" if args.bucket else "rclone"
 
+def _same_bucket(remote, bucket):
+    """True when rclone remote path `remote` names R2 bucket `bucket` directly.
+
+    `r2:claude-session-archive` passes. A crypt remote (`r2crypt:`) has no
+    bucket in its path and fails, as does any other bucket. With both --bucket
+    and --remote given, objects split by size; if the two named different
+    places, small objects, the manifest and the state file would go to one and
+    large objects to the other, and verify -- which reads each object back
+    from wherever it sent it -- could not notice.
+    """
+    _, sep, path = remote.partition(":")
+    return bool(sep) and path.strip("/").split("/")[0] == bucket
+
 def _transfer_timeout(nbytes):
     """Seconds allowed for one object transfer. The healthy 273 MB put of
     claude/2026-06 took 40s; the 2026-09-21 put that silently stored nothing
@@ -654,6 +670,11 @@ def main():
     a = ap.parse_args()
     if a.command in ("push", "verify") and not (a.remote or a.bucket):
         log("--bucket NAME (wrangler) or --remote NAME (rclone) required"); return 2
+    if a.command in ("push", "verify") and a.remote and a.bucket \
+            and not _same_bucket(a.remote, a.bucket):
+        log(f"--bucket {a.bucket} and --remote {a.remote} must name the same R2 bucket "
+            f"on a plain remote (e.g. --remote r2:{a.bucket}); objects are split between them "
+            f"by size. For an rclone crypt remote, pass --remote alone."); return 2
     return {"plan": cmd_plan, "pack": cmd_pack, "push": cmd_push,
             "verify": cmd_verify, "prune": cmd_prune, "rotate": cmd_rotate}[a.command](a)
 
