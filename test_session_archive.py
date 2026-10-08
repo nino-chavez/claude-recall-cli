@@ -7,9 +7,15 @@ key does not exist", and exited before prune. These tests pin both halves of
 the fix: push confirms the object before marking it, and verify un-marks an
 object the remote says is absent.
 
-Hermetic: the module's OUT/STATE/HOME point at a temp dir and `_wrangler` is
-replaced by an in-memory bucket, so no test reaches R2, `op`, or the real
-~/.claude/archived_sessions/archive-state.json.
+Measured 2026-10-08: codex-archived/2026-08 packed to 906 MB, `wrangler r2
+object put` refuses anything at or over 315 MB, and the launcher only passed
+--bucket, so push failed and the cycle stopped before verify and prune. With
+--bucket and --remote both given, each object now picks its tool by size; the
+TransportChosenBySize tests pin that choice for the upload and the read-back.
+
+Hermetic: the module's OUT/STATE/HOME point at a temp dir and `_wrangler` /
+`_rclone` are replaced by an in-memory bucket, so no test reaches R2, `op`, or
+the real ~/.claude/archived_sessions/archive-state.json.
 """
 
 import argparse
@@ -76,6 +82,30 @@ class FakeR2:
             Path(file).write_bytes(self.objects[key])
             return subprocess.CompletedProcess([op], 0, "Download complete.\n", "")
         raise AssertionError(f"unexpected wrangler op {op}")
+
+
+class FakeRclone:
+    """Stands in for `rclone copy`, sharing FakeR2's object store so a put
+    through one tool is visible to a get through the other, as in R2."""
+
+    def __init__(self, store, remote="r2:test-bucket"):
+        self.store = store
+        self.remote = remote
+        self.calls = []
+
+    def __call__(self, remote, op, src, dst, *rest, timeout=None):
+        self.calls.append((op, src, dst, timeout))
+        assert op == "copy", op
+        if src.startswith(self.remote + "/"):           # remote object -> local dir
+            key = src[len(self.remote) + 1:]
+            if key not in self.store:
+                return subprocess.CompletedProcess([op], 1, "", "ERROR : NoSuchKey\n")
+            Path(dst, os.path.basename(key)).write_bytes(self.store[key])
+            return subprocess.CompletedProcess([op], 0, "", "")
+        prefix = dst[len(self.remote):].strip("/")      # local file -> remote dir
+        key = f"{prefix}/{os.path.basename(src)}" if prefix else os.path.basename(src)
+        self.store[key] = Path(src).read_bytes()
+        return subprocess.CompletedProcess([op], 0, "", "")
 
 
 class ArchiveTestCase(unittest.TestCase):
@@ -201,6 +231,112 @@ class VerifyClearsPushedOnlyWhenKeyIsAbsent(ArchiveTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.r2.objects[NAME], self.payload)
         self.assertIsNotNone(self.obj()["pushed"])
+
+
+class TransportRule(unittest.TestCase):
+    def ns(self, bucket="b", remote="r"):
+        return argparse.Namespace(bucket=bucket, remote=remote)
+
+    def test_both_given_size_decides_and_the_limit_itself_switches(self):
+        lim = sa.WRANGLER_MAX_BYTES
+        self.assertEqual(sa._transport(self.ns(), lim - 1), "wrangler")
+        self.assertEqual(sa._transport(self.ns(), lim), "rclone")
+        self.assertEqual(sa._transport(self.ns(), 905_729_138), "rclone")  # codex-archived/2026-08
+
+    def test_one_given_is_used_whatever_the_size(self):
+        self.assertEqual(sa._transport(self.ns(remote=""), 10**10), "wrangler")
+        self.assertEqual(sa._transport(self.ns(bucket=""), 0), "rclone")
+
+
+class TransportChosenBySize(ArchiveTestCase):
+    """push/verify with --bucket AND --remote. WRANGLER_MAX_BYTES is lowered to
+    the 4 KB payload so "oversized" needs no 315 MB fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.rclone = FakeRclone(self.r2.objects)
+        self.saved_rclone, self.saved_limit = sa._rclone, sa.WRANGLER_MAX_BYTES
+        sa._rclone = self.rclone
+        self.args = argparse.Namespace(bucket="test-bucket", remote="r2:test-bucket")
+
+    def tearDown(self):
+        sa._rclone, sa.WRANGLER_MAX_BYTES = self.saved_rclone, self.saved_limit
+        super().tearDown()
+
+    def wrangler_ops(self):
+        return [op for op, path, _ in self.r2.calls if path.endswith(NAME)]
+
+    def rclone_ops(self):
+        base = os.path.basename(NAME)
+        return [op for op, src, _, _ in self.rclone.calls if src.endswith(base)]
+
+    def test_under_the_limit_goes_through_wrangler_only(self):
+        sa.WRANGLER_MAX_BYTES = len(self.payload) + 1
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.wrangler_ops(), ["put", "get"])
+        self.assertEqual(self.rclone_ops(), [])
+        self.assertIn("MB, wrangler)", out)
+
+    def test_at_the_limit_goes_through_rclone_for_put_and_read_back(self):
+        sa.WRANGLER_MAX_BYTES = len(self.payload)   # the cap is "at or over"
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.wrangler_ops(), [])
+        self.assertEqual(self.rclone_ops(), ["copy", "copy"])
+        self.assertEqual(self.r2.objects[NAME], self.payload)
+        self.assertIsNotNone(self.obj()["pushed"])
+        self.assertIn("MB, rclone)", out)
+        self.assertNotIn("over wrangler", out)
+
+    def test_oversized_object_that_rclone_fails_to_land_is_not_marked_pushed(self):
+        sa.WRANGLER_MAX_BYTES = len(self.payload)
+        def phantom(remote, op, src, dst, *rest, timeout=None):
+            r = FakeRclone.__call__(self.rclone, remote, op, src, dst, *rest, timeout=timeout)
+            if not src.startswith("r2:"): self.r2.objects.pop(NAME, None)   # exit 0, stored nothing
+            return r
+        sa._rclone = phantom
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(self.obj()["pushed"])
+        self.assertIn("not in remote", out)
+
+    def test_bucket_only_still_refuses_an_oversized_object_by_name(self):
+        sa.WRANGLER_MAX_BYTES = len(self.payload)
+        self.args = argparse.Namespace(bucket="test-bucket", remote="")
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 1)
+        self.assertIn("over wrangler's 315 MB", out)
+        self.assertIn("--remote", out)
+        self.assertEqual(self.wrangler_ops(), [])
+        self.assertEqual(self.rclone_ops(), [])
+        self.assertIsNone(self.obj()["pushed"])
+
+    def test_remote_only_uses_rclone_whatever_the_size(self):
+        sa.WRANGLER_MAX_BYTES = 10**9
+        self.args = argparse.Namespace(bucket="", remote="r2:test-bucket")
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.wrangler_ops(), [])
+        self.assertEqual(self.rclone_ops(), ["copy", "copy"])
+
+    def test_read_back_of_an_oversized_object_uses_rclone(self):
+        # verify and the post-upload confirm both go through _remote_get.
+        sa.WRANGLER_MAX_BYTES = len(self.payload)
+        self.r2.objects[NAME] = self.payload
+        with tempfile.TemporaryDirectory() as td:
+            local, r = sa._remote_get(self.args, NAME, td, len(self.payload))
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(Path(local).read_bytes(), self.payload)
+        self.assertEqual(self.wrangler_ops(), [])
+        self.assertEqual(self.rclone_ops(), ["copy"])
+
+    def test_both_given_needs_both_tools_installed(self):
+        sa.shutil.which = lambda tool: None if tool == "rclone" else f"/fake/{tool}"
+        rc, out = self.run_cmd(sa.cmd_push)
+        self.assertEqual(rc, 1)
+        self.assertIn("rclone not found", out)
+        self.assertIsNone(self.obj()["pushed"])
 
 
 class MissingKeyDetection(unittest.TestCase):
@@ -433,6 +569,30 @@ class VerifyToleratesFilesWrittenSincePack(ArchiveTestCase):
         rc, out = self.run_cmd(sa.cmd_verify)
         self.assertEqual(rc, 1)
         self.assertIn("CONTENT MISMATCH", out)
+
+
+@unittest.skipUnless(shutil.which("zstd"), "zstd not installed")
+class VerifyOversizedObjectThroughRclone(VerifyToleratesFilesWrittenSincePack):
+    """The two verify cases above, with the object at or over wrangler's cap and
+    both --bucket and --remote given: the bytes must come back via rclone."""
+
+    def setUp(self):
+        super().setUp()
+        self.rclone = FakeRclone(self.r2.objects)
+        self.saved_rclone, self.saved_limit = sa._rclone, sa.WRANGLER_MAX_BYTES
+        sa._rclone = self.rclone
+        sa.WRANGLER_MAX_BYTES = 1
+        self.args = argparse.Namespace(bucket="test-bucket", remote="r2:test-bucket")
+
+    def tearDown(self):
+        sa._rclone, sa.WRANGLER_MAX_BYTES = self.saved_rclone, self.saved_limit
+        super().tearDown()
+
+    def test_the_bytes_came_through_rclone_not_wrangler(self):
+        rc, out = self.run_cmd(sa.cmd_verify)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([op for op, *_ in self.r2.calls], [])
+        self.assertEqual([op for op, *_ in self.rclone.calls], ["copy"])
 
 
 if __name__ == "__main__":

@@ -2,13 +2,14 @@
 """Cold-archive agent session transcripts to object storage.
 
 Groups transcripts into solid monthly tarballs (zstd -19), writes a sha256
-manifest, uploads via rclone, and verifies by pulling the object back and
-diffing it against local before anything is considered archived.
+manifest, uploads each object with wrangler or rclone, and verifies by pulling
+the object back and diffing it against local before anything is considered
+archived.
 
     session-archive.py plan                 # what would be archived (default)
     session-archive.py pack                 # build tarballs + manifest locally
-    session-archive.py push  --remote NAME  # rclone copy to remote
-    session-archive.py verify --remote NAME # download, sha256 + content diff
+    session-archive.py push   --bucket B [--remote R]  # upload; see Transport below
+    session-archive.py verify --bucket B [--remote R]  # download, sha256 + content diff
     session-archive.py prune --yes          # delete locals ONLY for verified objects
     session-archive.py rotate --yes         # age out archives past --keep-months (default 12)
 
@@ -27,6 +28,17 @@ Design notes
 * Compression is plain `zstd -19` on a solid tar. Measured on this corpus:
   per-file 3.6x, solid 4.1x, --long=31 4.1x, -22 --ultra 4.2x. Window tuning
   and --ultra buy nothing, so they are not used.
+* Transport. `--bucket` sends through wrangler: no extra dependency, but
+  `wrangler r2 object put` refuses an object at or over 315 MB
+  (WRANGLER_MAX_BYTES). `--remote` sends through rclone, which has no such cap
+  and needs no rclone.conf entry when the launcher configures the S3 remote
+  from RCLONE_CONFIG_R2_* variables. Given both, each object picks by size --
+  wrangler under the limit, rclone at or over it -- for the upload and for
+  every read-back of that object. A packed Codex month is 0.9-1.7 GB, so
+  bucket-only stalled the weekly cycle at push from 2026-10-08
+  (codex-archived/2026-08, 906 MB), and verify and prune never ran. Given
+  --bucket alone, an oversized object is refused with a message naming
+  --remote rather than attempted. See _transport().
 * Encryption is NOT handled here. Point --remote at an `rclone crypt` remote
   wrapping R2; rclone encrypts the finished tarball on upload.
 * Rotation has two halves. The authoritative one is server-side: an R2 bucket
@@ -350,6 +362,20 @@ def _rclone(remote, *args, timeout=None):
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"rclone timed out after {timeout}s")
 
+def _transport(args, nbytes):
+    """Which tool carries an object of nbytes: "wrangler" or "rclone".
+
+    wrangler costs nothing extra, but `r2 object put` refuses an object at or
+    over WRANGLER_MAX_BYTES, and a packed Codex month is 0.9-1.7 GB. With both
+    --bucket and --remote given, size decides, and the read-back of an object
+    uses the same answer as its upload, so nothing is fetched by a tool that
+    could not have sent it. With one of them given, that one is used and
+    cmd_push reports the oversize case instead of attempting it.
+    """
+    if args.bucket and args.remote:
+        return "wrangler" if nbytes < WRANGLER_MAX_BYTES else "rclone"
+    return "wrangler" if args.bucket else "rclone"
+
 def _transfer_timeout(nbytes):
     """Seconds allowed for one object transfer. The healthy 273 MB put of
     claude/2026-06 took 40s; the 2026-09-21 put that silently stored nothing
@@ -370,7 +396,7 @@ def _is_missing_key(r):
 def _remote_get(args, name, td, nbytes):
     """Download object `name` into directory td. -> (local_path, CompletedProcess)."""
     local = os.path.join(td, os.path.basename(name))
-    if args.bucket:
+    if _transport(args, nbytes) == "wrangler":
         r = _wrangler(args.bucket, "get", f"{args.bucket}/{name}", f"--file={local}", "--remote",
                       timeout=_transfer_timeout(nbytes))
     else:
@@ -400,8 +426,9 @@ def _confirm_in_remote(args, name, o):
     return True, "sha256 matches"
 
 def cmd_push(args):
-    tool = "wrangler" if args.bucket else "rclone"
-    if not shutil.which(tool): log(f"{tool} not found"); return 1
+    tools = [t for t, on in (("wrangler", args.bucket), ("rclone", args.remote)) if on]
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing: log(f"{', '.join(missing)} not found"); return 1
     state = load_state()
     todo = [n for n, o in state["objects"].items() if o.get("packed") and not o.get("pushed")]
     if not todo: log("  nothing packed-and-unpushed"); return 0
@@ -419,16 +446,17 @@ def cmd_push(args):
                 f"if its transcripts are gone, this object cannot be re-sent")
             continue
         size = os.path.getsize(src)
-        if args.bucket and size >= WRANGLER_MAX_BYTES:
+        via = _transport(args, size)
+        if via == "wrangler" and size >= WRANGLER_MAX_BYTES:
             log(f"  push {name}: {size/1e6:.0f} MB is over wrangler's 315 MB object limit -- "
                 f"push it with --remote (rclone) instead"); ok_all = False; continue
-        if args.bucket:
-            log(f"  push {name} -> r2://{args.bucket}/{name}  ({size/1e6:.1f} MB)")
+        if via == "wrangler":
+            log(f"  push {name} -> r2://{args.bucket}/{name}  ({size/1e6:.1f} MB, wrangler)")
             r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote",
                           timeout=_transfer_timeout(size))
         else:
             dst = f"{args.remote}/{os.path.dirname(name)}"
-            log(f"  push {name} -> {dst}")
+            log(f"  push {name} -> {dst}  ({size/1e6:.1f} MB, rclone)")
             r = _rclone(args.remote, "copy", src, dst, "--progress", "--s3-chunk-size", "64M",
                         timeout=_transfer_timeout(size))
         if r.returncode != 0:
@@ -442,9 +470,12 @@ def cmd_push(args):
         save_state(state)
     for f in ("MANIFEST.jsonl", "archive-state.json"):
         src = os.path.join(OUT, f)
-        if args.bucket: _wrangler(args.bucket, "put", f"{args.bucket}/{f}", f"--file={src}", "--remote",
-                                  timeout=_transfer_timeout(os.path.getsize(src) if os.path.exists(src) else 0))
-        else: _rclone(args.remote, "copy", src, args.remote, timeout=600)
+        size = os.path.getsize(src) if os.path.exists(src) else 0
+        if _transport(args, size) == "wrangler":
+            _wrangler(args.bucket, "put", f"{args.bucket}/{f}", f"--file={src}", "--remote",
+                      timeout=_transfer_timeout(size))
+        else:
+            _rclone(args.remote, "copy", src, args.remote, timeout=600)
     return 0 if ok_all else 1
 
 def cmd_verify(args):
@@ -608,10 +639,12 @@ def main():
     ap.add_argument("--split-lead-days", type=int, default=15,
                     help="pack a month's cold files early once a pending file is within "
                          "this many days of its client deleting it (claude: cleanupPeriodDays)")
-    ap.add_argument("--remote", default=os.environ.get("SESSION_ARCHIVE_REMOTE", ""))
+    ap.add_argument("--remote", default=os.environ.get("SESSION_ARCHIVE_REMOTE", ""),
+                    help="rclone remote path, e.g. r2:BUCKET; no object size limit. "
+                         "With --bucket too, each object picks by size")
     ap.add_argument("--bucket", default=os.environ.get("SESSION_ARCHIVE_BUCKET", ""),
-                    help="R2 bucket name; uses wrangler instead of rclone "
-                         "(objects must be under 315 MB)")
+                    help="R2 bucket name; uses wrangler, which refuses objects at or "
+                         "over 315 MB. With --remote too, each object picks by size")
     ap.add_argument("--tree", action="append",
                     help="prune only: restrict to a tree "
                          "(claude | codex-sessions | codex-archived); repeatable")
