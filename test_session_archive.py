@@ -260,6 +260,9 @@ class BothTransportsMustNameOneBucket(unittest.TestCase):
         self.assertTrue(sa._same_bucket("r2:/claude-session-archive/", "claude-session-archive"))
         self.assertFalse(sa._same_bucket("r2:other-bucket", "claude-session-archive"))
         self.assertFalse(sa._same_bucket("r2crypt:", "claude-session-archive"))
+        # A prefix inside the bucket: wrangler writes BUCKET/<name>, rclone
+        # would write BUCKET/archive/<name> -- two places again (review of 6e70bc3).
+        self.assertFalse(sa._same_bucket("r2:claude-session-archive/archive", "claude-session-archive"))
         self.assertFalse(sa._same_bucket("claude-session-archive", "claude-session-archive"))
 
     def run_main(self, *argv):
@@ -289,6 +292,11 @@ class BothTransportsMustNameOneBucket(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertEqual(calls, [])
             self.assertIn("must name the same R2 bucket", out)
+
+    def test_prefix_inside_the_bucket_is_refused(self):
+        rc, out, calls = self.run_main("push", "--bucket", "b1", "--remote", "r2:b1/sub")
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [])
 
     def test_crypt_remote_with_bucket_is_refused(self):
         rc, out, calls = self.run_main("push", "--bucket", "b1", "--remote", "r2crypt:")

@@ -383,14 +383,16 @@ def _same_bucket(remote, bucket):
     """True when rclone remote path `remote` names R2 bucket `bucket` directly.
 
     `r2:claude-session-archive` passes. A crypt remote (`r2crypt:`) has no
-    bucket in its path and fails, as does any other bucket. With both --bucket
+    bucket in its path and fails, as does any other bucket, and so does a
+    prefix inside this one (`r2:BUCKET/sub`): wrangler writes `BUCKET/<name>`
+    while rclone would write `BUCKET/sub/<name>`. With both --bucket
     and --remote given, objects split by size; if the two named different
     places, small objects, the manifest and the state file would go to one and
     large objects to the other, and verify -- which reads each object back
     from wherever it sent it -- could not notice.
     """
     _, sep, path = remote.partition(":")
-    return bool(sep) and path.strip("/").split("/")[0] == bucket
+    return bool(sep) and path.strip("/") == bucket
 
 def _transfer_timeout(nbytes):
     """Seconds allowed for one object transfer. The healthy 273 MB put of
