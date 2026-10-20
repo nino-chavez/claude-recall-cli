@@ -1251,6 +1251,15 @@ CHEERLEAD_WORDS = {
     "love", "absolutely", "definitely", "totally", "wonderful",
 }
 PROFANITY = {"fuck", "shit", "damn", "hell", "crap", "wtf", "bs"}
+# Literal destructive commands. One owner for both classifiers: the draft
+# classifier flags them in a response, the prompt classifier in a request.
+# Patterns starting with `--` can't use \b before the dashes since `--` is
+# two non-word chars — \b requires a word/non-word boundary.
+DESTRUCTIVE_COMMAND_RE = re.compile(
+    r"(?:\b(?:force[ -]push|rm -rf|drop (?:table|database)|delete branch|"
+    r"reset --hard|amend (?:the )?published|truncate (?:table|database))\b"
+    r"|(?:^|\s)--(?:no-verify|force|hard))"
+)
 
 
 def _tone_stats(messages: list[str]) -> dict:
@@ -1411,9 +1420,11 @@ def classify_prompt_intent(prompt: str) -> list[tuple[str, str]]:
                          r"(sentence|paragraph|line)|short(ly)?|brief)\b", low):
             hits.append(("invites-vague-rationale", "explain without depth/audience constraint"))
 
-    # User explicitly mentions destructive ops.
+    # User explicitly mentions destructive ops, in words or as a literal
+    # command (`rm -rf`, `--no-verify`) the word list above does not cover.
     if re.search(r"\b(delete|remove|drop|reset|force[ -]push|truncate|"
-                 r"clean ?up (my|the) (git|repo|branches|database))\b", low):
+                 r"clean ?up (my|the) (git|repo|branches|database))\b", low) \
+            or DESTRUCTIVE_COMMAND_RE.search(low):
         # Strong destructive language — pause regardless of prior context.
         hits.append(("invites-destructive-action", "user requested destructive op"))
 
@@ -1461,10 +1472,11 @@ PROMPT_GUIDANCE = {
 
 
 def classify_situation(text: str) -> list[tuple[str, str]]:
-    """Classify a draft response or prompt into Poe-relevant situations.
+    """Classify an assistant draft into Poe-relevant situations.
     Returns list of (situation_id, evidence) tuples — one text can match
     multiple situations. Designed to be cheap (regex-only) so it can run
-    in hooks and tight loops."""
+    in hooks and tight loops. Drafts only: on user prompts its advice is
+    addressed to the wrong author (see cmd_prompt_hook)."""
     hits: list[tuple[str, str]] = []
     t = text.strip()
     if not t:
@@ -1507,14 +1519,7 @@ def classify_situation(text: str) -> list[tuple[str, str]]:
         hits.append(("cheerleading", ", ".join(cheer[:3])))
 
     # 4) Destructive-action signals (the rule's "still ask when").
-    # Note: patterns starting with `--` can't use \b before the dashes since
-    # `--` is two non-word chars — \b requires a word/non-word boundary.
-    destruct = re.search(
-        r"(?:\b(?:force[ -]push|rm -rf|drop (?:table|database)|delete branch|"
-        r"reset --hard|amend (?:the )?published|truncate (?:table|database))\b"
-        r"|(?:^|\s)--(?:no-verify|force|hard))",
-        low,
-    )
+    destruct = DESTRUCTIVE_COMMAND_RE.search(low)
     if destruct:
         hits.append(("destructive-action", destruct.group(0).strip()))
 
@@ -2422,11 +2427,17 @@ def cmd_prompt_hook() -> None:
     if prompt.lstrip().startswith(NOISE_PREFIXES):
         return
 
-    # Prompt-intent classification predicts elicitation shapes; situation
-    # classification catches drafts containing failure patterns directly
-    # (rare in user prompts, but cheap to also check).
+    # Prompt-intent classification predicts elicitation shapes. The draft
+    # classifier (classify_situation) is deliberately not run here: its labels
+    # and guidance describe an assistant response, so on a prompt they advise
+    # the assistant about text the user wrote. Over 9,655 logged prompts
+    # (2026-05-13 to 2026-10-20) it fired on 35%, 3,190 times as
+    # vague-rationale (any prompt over 200 chars without "because"), and was
+    # the only output for 1,383 prompts. Its hedge check is a subset of
+    # invites-hedging; its destructive commands now feed
+    # invites-destructive-action. Evidence:
+    # docs/evidence/2026-10-20-situation-classifier-jev.md.
     prompt_intents = classify_prompt_intent(prompt)
-    situations = classify_situation(prompt)
 
     # Topic-driven retrieval: extract content words from the prompt, query Poe.
     tokens = [
@@ -2457,7 +2468,7 @@ def cmd_prompt_hook() -> None:
         except sqlite3.OperationalError:
             relevant_signals = []
 
-    has_output = bool(prompt_intents or situations or relevant_signals)
+    has_output = bool(prompt_intents or relevant_signals)
 
     # Telemetry: one JSONL line per invocation.
     try:
@@ -2468,7 +2479,6 @@ def cmd_prompt_hook() -> None:
                 "prompt_chars": len(prompt),
                 "prompt_head": redact_secrets(prompt[:120].replace("\n", " ")),
                 "intents": [i[0] for i in prompt_intents],
-                "situations": [s[0] for s in situations],
                 "signals": [f"{r[0]}/{r[1]}" for r in relevant_signals],
                 "emitted": has_output,
             }
@@ -2485,12 +2495,6 @@ def cmd_prompt_hook() -> None:
         out.append("Failure modes this prompt is likely to elicit:")
         for intent_id, _ in prompt_intents:
             out.append(f"- `{intent_id}` — {PROMPT_GUIDANCE.get(intent_id, '')}")
-    if situations:
-        if prompt_intents:
-            out.append("")
-        out.append("Anticipated Poe situations from prompt shape:")
-        for sit_id, _ in situations:
-            out.append(f"- `{sit_id}` — {SITUATION_GUIDANCE.get(sit_id, '').splitlines()[0]}")
     if relevant_signals:
         out.append("")
         out.append("Relevant past Nino signals (treat as priors, not commands):")
