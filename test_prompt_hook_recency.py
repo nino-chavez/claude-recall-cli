@@ -1,4 +1,4 @@
-"""Recency-floor + self-echo guards for the per-prompt Poe hook.
+"""Recency-floor, self-echo and draft-label guards for the per-prompt Poe hook.
 
 Regression test for the 2026-05-29 cross-session leak: an instruction typed into
 a concurrent, still-running session surfaced in ANOTHER session's prompt-hook as
@@ -12,8 +12,13 @@ Or:  /usr/bin/python3 test_prompt_hook_recency.py
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import sqlite3
+import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -154,6 +159,58 @@ def test_pasted_image_reference_excluded():
     )
     out = poe._relevant_signals(conn, TOKENS, FLOOR, current_session="me")
     assert out == [], f"image-reference row must not surface, got {out}"
+
+
+def _run_prompt_hook(prompt: str) -> tuple[str, list[dict]]:
+    """Run cmd_prompt_hook on one prompt with every file it touches redirected
+    to a temp folder and no recall DB, so only the classifiers can emit."""
+    tmp = Path(tempfile.mkdtemp())
+    saved = (poe.POE_DIR, poe.HOOK_LOG_PATH, poe.RECALL_DB, sys.stdin)
+    poe.POE_DIR, poe.HOOK_LOG_PATH, poe.RECALL_DB = tmp, tmp / "hook.log", tmp / "missing.db"
+    sys.stdin = io.StringIO(json.dumps({"prompt": prompt, "session_id": "test"}))
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            poe.cmd_prompt_hook()
+    finally:
+        poe.POE_DIR, poe.HOOK_LOG_PATH, poe.RECALL_DB, sys.stdin = saved
+    log = tmp / "hook.log"
+    rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return out.getvalue(), rows
+
+
+# Over 200 chars, no causal word, no prompt-intent trigger: the draft
+# classifier's vague-rationale fires on it, the prompt hook must not.
+LONG_PLAIN_PROMPT = (
+    "The dashboard numbers look different on the second machine. The sync ran "
+    "twice this morning and the totals still disagree. Check the ingest "
+    "watermark, compare both outbox folders, and write down which rows are "
+    "missing from the second copy."
+)
+
+
+def test_long_prompt_emits_no_draft_labels():
+    """Draft advice ("add the load-bearing why") must not be injected for text
+    the user wrote. It fired on 35% of 9,655 logged prompts before the fix."""
+    assert len(LONG_PLAIN_PROMPT) > 200
+    fired = {s for s, _ in poe.classify_situation(LONG_PLAIN_PROMPT)}
+    assert "vague-rationale" in fired, "fixture no longer exercises the draft rule"
+    out, rows = _run_prompt_hook(LONG_PLAIN_PROMPT)
+    assert out == "", f"prompt hook should stay silent, got {out!r}"
+    assert len(rows) == 1 and not rows[0].get("situations"), rows
+
+
+def test_literal_destructive_command_still_flagged():
+    """The draft classifier was the only thing catching literal commands on
+    prompts; they must survive its removal as a prompt intent."""
+    for prompt in (
+        "Run rm -rf build/ and rebuild the docs site from scratch.",
+        "Commit the hook fix with --no-verify so the broken check is skipped.",
+    ):
+        intents = {i for i, _ in poe.classify_prompt_intent(prompt)}
+        assert "invites-destructive-action" in intents, (prompt, intents)
+        out, _ = _run_prompt_hook(prompt)
+        assert "invites-destructive-action" in out, out
 
 
 if __name__ == "__main__":
