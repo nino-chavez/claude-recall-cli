@@ -81,12 +81,12 @@ only on `hesitation`. The "regex" arm of `hooks.hesitation` is therefore this fu
 hesitation label. Its Jev comparison used real held-out turn endings, two judges from
 different vendors and a pre-registered protocol. The results and the later threshold
 re-score are in operator `docs/evidence/2026-09-18-jev/` and
-`docs/evidence/2026-09-21-jev-ecosystem/`. Jev figures are not repeated here because
-this repository is public. The operator evidence notes that TypeSafe's customer
-agreement reportedly restricts publishing Jev performance numbers.
+`docs/evidence/2026-09-21-jev-ecosystem/`. Jev figures stay in that private repository
+and are not repeated in this public one.
 
 The shadow log has been collecting since 2026-09-18: 4,801 real turn endings by
-2026-10-20. In those rows the regex blocked 47 endings and stayed silent on 4,653. The
+2026-10-20, 4,704 of them with a Jev answer. On those 4,704 the regex blocked 47, was
+overridden by its own still-ask or loop guard on 4, and stayed silent on 4,653. The
 log has no reference labels, so it shows how often the two arms disagree, not which one
 is right. Picking the threshold from these rows is already an open item in operator's
 evidence README; run `shadow-report.py --closers` there.
