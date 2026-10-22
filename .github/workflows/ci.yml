@@ -40,6 +40,7 @@ jobs:
           test_cloudflare_schema.py
           test_context_plane.py
           test_cross_client_transcripts.py
+          test_mcp_auth_headers.py
           test_prompt_hook_recency.py
           test_session_archive.py
 
