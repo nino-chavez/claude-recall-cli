@@ -72,17 +72,19 @@ with-secret 'Cloudflare recall-context-plane' \
 
 The configuration uses Claude Code's environment expansion for the URL and authorization header. Keep the server at user scope if it should be available in every repository. Do not mark the server or its write tool as pre-approved.
 
-For a desktop-launched session that does not inherit the token, use Claude Code's `headersHelper` with the supplied 1Password adapter:
+For a desktop-launched session that does not inherit the token, use Claude Code's `headersHelper` with the supplied adapter. Call it directly, not through `with-secret`:
 
 ```json
 {
   "type": "http",
   "url": "https://recall-context-plane.<account>.workers.dev/mcp",
-  "headersHelper": "with-secret 'Cloudflare recall-context-plane' --as RECALL_CONTEXT_TOKEN -- python3 /absolute/path/to/adapters/mcp-auth-headers.py"
+  "headersHelper": "/usr/bin/python3 /absolute/path/to/adapters/mcp-auth-headers.py"
 }
 ```
 
-The helper runs on connection and writes only the JSON header object that Claude Code expects.
+The helper runs on connection and writes only the JSON header object that Claude Code expects. It caches the token in the macOS login Keychain (service `recall-context-plane-token`) for 12 hours and reads 1Password through `with-secret` only when that copy has expired. Claude Code allows a helper about 10 seconds; a slow `op` call used to use all of it, and the client then fell back to OAuth and reported `Dynamic Client Registration rejected (HTTP 404)`. That error means the token did not arrive, not that the server needs a sign-in. If 1Password does not answer within 7 seconds, the helper sends the expired copy.
+
+After rotating the token, run the helper once with `--refresh`, or with `--clear-cache` to drop the copy. `RECALL_CONTEXT_TOKEN` in the environment still overrides the cache, which is why wrapping the helper in `with-secret` defeats it.
 
 ## Gemini CLI MCP
 
