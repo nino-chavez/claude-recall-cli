@@ -349,6 +349,13 @@ class SplitPackPlanner(unittest.TestCase):
         self.assertEqual(got, {"claude/2026-07.tar.zst": sorted(p for p, _ in f[:2]),
                                "claude/2026-07.part2.tar.zst": [f[2][0]]})
 
+    def test_previously_pushed_archive_is_never_rebuilt_from_survivors(self):
+        files = self.files(80, 70)
+        obj = self.obj(files, 60, verified=False)
+        obj.update(pushed=None, first_pushed="2026-01-01T00:00:00+00:00")
+        self.assertEqual(self.plan({("claude", "2026-07"): files[:1]},
+                                   {"claude/2026-07.tar.zst": obj}, exists=False), [])
+
     def test_part_names(self):
         self.assertEqual(sa.obj_name("claude", "2026-07", 3), "claude/2026-07.part3.tar.zst")
         self.assertEqual(sa.part_of("claude/2026-07.part3.tar.zst"), 3)
@@ -537,6 +544,26 @@ class CompressedTranscripts(ArchiveTestCase):
         self.assertEqual(groups[("codex-archived", "2026-03")][0][0], str(member))
         self.assertEqual(sa.count_lines(member), 2)
 
+    def test_pack_keeps_corrupt_file_but_archives_readable_files(self):
+        root = Path(sa.HOME) / ".codex/archived_sessions"
+        root.mkdir(parents=True)
+        bad, good = root / "bad.jsonl.zst", root / "good.jsonl"
+        bad.write_bytes(b"broken zstd")
+        good.write_text('{}\n')
+        old = time.time() - 90 * 86400
+        for p in (bad, good): os.utime(p, (old, old))
+        sa.save_state({"objects": {}})
+        self.args.cutoff_days = 45
+        self.args.split_lead_days = 15
+        with patch.dict(sa.TREES, {"codex-archived":str(root)}, clear=True):
+            rc, out = self.run_cmd(sa.cmd_pack)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(bad.exists())
+        objects = list(sa.load_state()["objects"].values())
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["members"], [os.path.relpath(good, sa.HOME)])
+        self.assertIn("unreadable", out)
+
     def test_corrupt_compressed_transcript_is_not_counted_as_text(self):
         member = Path(self.tmp.name) / "corrupt.jsonl.zst"
         member.write_bytes(b"not a zstd stream")
@@ -577,6 +604,7 @@ class CompressedArchiveRoundTrip(ArchiveTestCase):
         self.assertEqual(self.run_cmd(sa.cmd_verify)[0], 1)
         obj = sa.load_state()["objects"][self.name]
         self.assertIsNone(obj["verified"])
+        self.assertTrue(obj["first_pushed"])
         self.assertNotIn("member_sha256", obj)
         self.assertTrue(self.member.exists())
 

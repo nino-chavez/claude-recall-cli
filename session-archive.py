@@ -228,7 +228,9 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
         mine = {n: o for n, o in objects.items() if o.get("tree") == tree and o.get("month") == mo}
         # Packed but never verified, and the local tarball is gone: nothing can
         # push it, so it is rebuilt under its own name (below).
-        rebuild = sorted(n for n, o in mine.items() if not o.get("verified") and not local_exists(n))
+        rebuild = sorted(n for n, o in mine.items()
+                         if not any(o.get(k) for k in ("verified", "pushed", "first_pushed"))
+                         and not local_exists(n))
         covered = {}
         for n, o in mine.items():
             if n in rebuild: continue
@@ -318,22 +320,39 @@ def cmd_pack(args):
         dest = os.path.join(OUT, name)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         snapshot = time.time()  # before any member is read
-        raw = sum(os.path.getsize(p) for p in paths)
-        lines = sum(count_lines(p) for p in paths)
+        raw = lines = 0
+        readable = []
+        for path in paths:
+            try:
+                n = count_lines(path)
+                size = os.path.getsize(path)
+            except OSError as e:
+                log(f"    skipped unreadable transcript (kept on disk): {path}: {e}")
+                continue
+            readable.append(path)
+            raw += size
+            lines += n
+        paths = readable
+        if not paths: continue
         held = f", {it['held']} held for a later part" if it["held"] else ""
         log(f"  packing {name}: {len(paths)} files, {raw/1e9:.2f} GB ({it['reason']}{held}) ...")
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as t: tarpath = t.name
         try:
             with tarfile.open(tarpath, "w") as tf:
                 for p in paths: tf.add(p, arcname=os.path.relpath(p, HOME))
-            with open(dest, "wb") as out:
+            with open(dest + ".tmp", "wb") as out:
                 r = subprocess.run(["zstd", "-19", "-T0", "-c", tarpath],
                                    stdin=subprocess.DEVNULL, stdout=out,
                                    stderr=subprocess.PIPE, timeout=7200)
             if r.returncode != 0:
                 log(f"    zstd failed: {r.stderr.decode()[:200]}"); continue
+            os.replace(dest + ".tmp", dest)
+        except (OSError, subprocess.SubprocessError, tarfile.TarError) as e:
+            log(f"    pack failed for {name}; local transcripts kept: {e}")
+            continue
         finally:
             os.unlink(tarpath)
+            if os.path.exists(dest + ".tmp"): os.unlink(dest + ".tmp")
         digest, size = sha256(dest), os.path.getsize(dest)
         state["objects"][name] = {
             "tree": tree, "month": mo, "members": [os.path.relpath(p, HOME) for p in paths],
@@ -546,6 +565,7 @@ def cmd_push(args):
             ok_all = False; continue
         log(f"    confirmed in remote ({why})")
         o["pushed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        o.setdefault("first_pushed", o["pushed"])
         save_state(state)
     if not _sync_metadata(args, state): ok_all = False
     return 0 if ok_all else 1
@@ -562,6 +582,9 @@ def cmd_verify(args):
     for name in sorted(todo):
         o = state["objects"][name]
         log(f"  verify {name}")
+        # Publication history is permanent, unlike fresh deletion permission.
+        # A failed recheck must never rebuild this key from partial survivors.
+        o.setdefault("first_pushed", o["pushed"])
         # Revoke old permission before any fallible remote operation.
         o["verified"] = None
         o.pop("member_sha256", None)
