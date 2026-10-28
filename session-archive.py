@@ -41,15 +41,21 @@ Design notes
   without storing anything, and the stale flag blocked that month for weeks.
   If verify later finds the key absent, it clears `pushed` so the next push
   re-uploads; any other verify failure leaves the flag alone.
-* prune is gated on a passing verify recorded in the state file -- never on
-  ingest watermarks. poe-extract's watermark proves ingestion by poe-extract;
+* Both .jsonl and .jsonl.zst are supported. Stored bytes are preserved; logical
+  JSONL is decoded only to read timestamps and count records.
+* Cold Codex files pack in parts without waiting for recently resumed chats.
+* prune requires a restore verification less than one hour old, matching
+  member hashes and native archived status -- never ingest watermarks. poe-extract's watermark proves ingestion by poe-extract;
   artifact-miner.py rglobs the whole corpus with no watermark at all, so
   watermark coverage does not mean a file is finished being read.
 """
 from __future__ import annotations
-import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
+import argparse, glob, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tarfile, tempfile, time
+import urllib.request, urllib.error
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timezone
+from pathlib import Path
 
 HOME = os.path.expanduser("~")
 TREES = {
@@ -62,6 +68,7 @@ STATE = os.path.join(OUT, "archive-state.json")
 CLAUDE_SETTINGS = "~/.claude/settings.json"
 CLAUDE_DEFAULT_CLEANUP_DAYS = 30   # Claude Code's own default when cleanupPeriodDays is unset
 WRANGLER_MAX_BYTES = 315 * 1000 * 1000
+VERIFY_MAX_AGE_SECONDS = 3600
 TS    = re.compile(r'"timestamp":\s*"(\d{4})-(\d{2})')
 
 def log(m): print(m, flush=True)
@@ -69,13 +76,45 @@ def log(m): print(m, flush=True)
 def load_state():
     try:
         with open(STATE) as f: return json.load(f)
-    except Exception: return {"objects": {}}
+    except FileNotFoundError: return {"objects": {}}
 
 def save_state(s):
     os.makedirs(OUT, exist_ok=True)
     tmp = STATE + ".tmp"
     with open(tmp, "w") as f: json.dump(s, f, indent=1, sort_keys=True)
     os.replace(tmp, STATE)
+
+def transcript_lines(path):
+    """Stream logical JSONL, preserving the original bytes for archiving.
+
+    Close the generator after a prefix scan so zstd cannot outlive its reader.
+    Full reads check the decoder's exit status, including truncated streams.
+    """
+    if not os.fspath(path).endswith(".jsonl.zst"):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            yield from f
+        return
+    with tempfile.TemporaryFile() as errors:
+        p = subprocess.Popen(["zstd", "-q", "-dc", "--", os.fspath(path)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=errors, text=True, encoding="utf-8", errors="replace")
+        complete = False
+        try:
+            yield from p.stdout
+            complete = True
+        finally:
+            p.stdout.close()
+            if not complete and p.poll() is None:
+                p.terminate()
+            try:
+                rc = p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=30)
+                raise OSError(f"zstd decoder timed out: {path}")
+            if complete and rc:
+                errors.seek(0)
+                raise OSError(f"zstd decode failed: {path}: {errors.read(200).decode(errors='replace')}")
 
 def content_month(path, scan=400):
     """(month, source) for a transcript.
@@ -89,7 +128,7 @@ def content_month(path, scan=400):
     archived, and the fallback must be visible in `plan`.
     """
     try:
-        with open(path, errors="ignore") as f:
+        with closing(transcript_lines(path)) as f:
             for i, line in enumerate(f):
                 m = TS.search(line)
                 if m: return f"{m.group(1)}-{m.group(2)}", "content"
@@ -110,7 +149,7 @@ def sha256(path, buf=1 << 20):
 
 def count_lines(path):
     n = 0
-    with open(path, errors="ignore") as f:
+    with closing(transcript_lines(path)) as f:
         for _ in f: n += 1
     return n
 
@@ -121,7 +160,9 @@ def survey():
     for tree, root in TREES.items():
         root = os.path.expanduser(root)
         if not os.path.isdir(root): continue
-        for p in glob.glob(root + "/**/*.jsonl", recursive=True):
+        paths = glob.glob(root + "/**/*.jsonl", recursive=True)
+        paths += glob.glob(root + "/**/*.jsonl.zst", recursive=True)
+        for p in paths:
             mo, src = content_month(p)
             if not mo:
                 fallback.append((p, "unreadable")); continue
@@ -187,10 +228,16 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
         mine = {n: o for n, o in objects.items() if o.get("tree") == tree and o.get("month") == mo}
         # Packed but never verified, and the local tarball is gone: nothing can
         # push it, so it is rebuilt under its own name (below).
-        rebuild = sorted(n for n, o in mine.items() if not o.get("verified") and not local_exists(n))
+        rebuild = sorted(n for n, o in mine.items()
+                         if not any(o.get(k) for k in ("verified", "pushed", "first_pushed"))
+                         and not local_exists(n))
+        # A confirmed-missing published object must not be overwritten from
+        # partial survivors. Rescue those survivors into a new part instead.
+        missing = {n for n, o in mine.items() if o.get("first_pushed")
+                   and not o.get("pushed") and not local_exists(n)}
         covered = {}
         for n, o in mine.items():
-            if n in rebuild: continue
+            if n in rebuild or n in missing: continue
             snap = snapshot_epoch(o)
             for rel in o.get("members", []):
                 covered[rel] = max(covered.get(rel, 0.0), snap)
@@ -212,6 +259,10 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
         age = lambda m: (now - m) / 86400
         if all(age(m) >= cutoff_days for _, m in pending):
             pick, reason = pending, "month cold"
+        elif tree.startswith("codex-"):
+            pick = [(p, m) for p, m in pending if age(m) >= cutoff_days]
+            if not pick: continue
+            reason = "split: cold Codex files; recent chats held"
         else:
             ret = retention(tree)
             if ret is None: continue
@@ -273,28 +324,46 @@ def cmd_pack(args):
         dest = os.path.join(OUT, name)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         snapshot = time.time()  # before any member is read
-        raw = sum(os.path.getsize(p) for p in paths)
-        lines = sum(count_lines(p) for p in paths)
+        raw = lines = 0
+        readable = []
+        for path in paths:
+            try:
+                n = count_lines(path)
+                size = os.path.getsize(path)
+            except OSError as e:
+                log(f"    skipped unreadable transcript (kept on disk): {path}: {e}")
+                continue
+            readable.append(path)
+            raw += size
+            lines += n
+        paths = readable
+        if not paths: continue
         held = f", {it['held']} held for a later part" if it["held"] else ""
         log(f"  packing {name}: {len(paths)} files, {raw/1e9:.2f} GB ({it['reason']}{held}) ...")
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as t: tarpath = t.name
         try:
             with tarfile.open(tarpath, "w") as tf:
                 for p in paths: tf.add(p, arcname=os.path.relpath(p, HOME))
-            with open(dest, "wb") as out:
+            with open(dest + ".tmp", "wb") as out:
                 r = subprocess.run(["zstd", "-19", "-T0", "-c", tarpath],
-                                   stdout=out, stderr=subprocess.PIPE)
+                                   stdin=subprocess.DEVNULL, stdout=out,
+                                   stderr=subprocess.PIPE, timeout=7200)
             if r.returncode != 0:
                 log(f"    zstd failed: {r.stderr.decode()[:200]}"); continue
+            os.replace(dest + ".tmp", dest)
+        except (OSError, subprocess.SubprocessError, tarfile.TarError) as e:
+            log(f"    pack failed for {name}; local transcripts kept: {e}")
+            continue
         finally:
             os.unlink(tarpath)
+            if os.path.exists(dest + ".tmp"): os.unlink(dest + ".tmp")
         digest, size = sha256(dest), os.path.getsize(dest)
         state["objects"][name] = {
             "tree": tree, "month": mo, "members": [os.path.relpath(p, HOME) for p in paths],
             "file_count": len(paths), "raw_bytes": raw, "line_count": lines,
             "archive_bytes": size, "sha256": digest,
             "packed": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "snapshot_at": round(snapshot, 3), "reason": it["reason"],
+            "snapshot_at": snapshot, "reason": it["reason"],
             "pushed": None, "verified": None,
         }
         save_state(state)
@@ -306,20 +375,12 @@ def _write_manifest(state):
     mpath = os.path.join(OUT, "MANIFEST.jsonl")
     with open(mpath, "w") as f:
         for name, o in sorted(state["objects"].items()):
-            f.write(json.dumps({"object": name, **{k: v for k, v in o.items() if k != "members"},
+            f.write(json.dumps({"object": name, **{k: v for k, v in o.items()
+                                                  if k not in ("members", "member_sha256")},
                                 "member_count": len(o.get("members", []))}) + "\n")
     log(f"  manifest -> {mpath}")
 
-def _wrangler(bucket, *args, timeout=None):
-    """R2 object ops via wrangler + the account-ops API token from 1Password.
-
-    wrangler's own OAuth token has no R2 scope on this machine, so we inject
-    CLOUDFLARE_API_TOKEN. The token value is read by op into this process's env
-    and never written to disk.
-
-    A timeout comes back as returncode 124, not an exception, so callers treat
-    it like any other failed transfer.
-    """
+def _cloudflare_env():
     env = dict(os.environ)
     if "CLOUDFLARE_API_TOKEN" not in env:
         r = subprocess.run(["op", "read",
@@ -337,11 +398,60 @@ def _wrangler(bucket, *args, timeout=None):
             capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
             env["CLOUDFLARE_ACCOUNT_ID"] = r.stdout.strip()
+    return env
+
+
+def _wrangler(bucket, *args, timeout=None):
+    """R2 object ops via wrangler + the account-ops API token from 1Password.
+
+    wrangler's own OAuth token has no R2 scope on this machine, so we inject
+    CLOUDFLARE_API_TOKEN. The token value is read by op into this process's env
+    and never written to disk.
+
+    A timeout comes back as returncode 124, not an exception, so callers treat
+    it like any other failed transfer.
+    """
+    env = _cloudflare_env()
     try:
         return subprocess.run(["wrangler", "r2", "object", *args],
                               capture_output=True, text=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"wrangler timed out after {timeout}s")
+
+
+def _r2_multipart(args, src, name):
+    """Use R2's S3 API for objects larger than Wrangler can upload.
+
+    Credentials stay in the child environment. The API verifies the supplied
+    token and returns its ID; its SHA-256 is the R2 S3 secret access key.
+    """
+    if not shutil.which("rclone"):
+        return subprocess.CompletedProcess([], 1, "", "rclone required for large R2 objects")
+    env = _cloudflare_env()
+    try:
+        token = env["CLOUDFLARE_API_TOKEN"]
+        request = urllib.request.Request("https://api.cloudflare.com/client/v4/user/tokens/verify",
+                                         headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.load(response)
+        if not result.get("success") or result["result"].get("status") != "active":
+            raise ValueError("Cloudflare token is not active")
+        env.update({
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_TYPE": "s3",
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_PROVIDER": "Cloudflare",
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_ACCESS_KEY_ID": result["result"]["id"],
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_SECRET_ACCESS_KEY": hashlib.sha256(token.encode()).hexdigest(),
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_ENDPOINT":
+                "https://" + env["CLOUDFLARE_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
+            "RCLONE_CONFIG_SESSION_ARCHIVE_R2_NO_CHECK_BUCKET": "true",
+        })
+        return subprocess.run(["rclone", "copyto", src,
+                               f"session_archive_r2:{args.bucket}/{name}",
+                               "--s3-chunk-size", "64M"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              env=env, timeout=_transfer_timeout(os.path.getsize(src)))
+    except (KeyError, ValueError, OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess([], 1, "", "R2 multipart authentication or transfer failed")
 
 
 def _rclone(remote, *args, timeout=None):
@@ -399,6 +509,26 @@ def _confirm_in_remote(args, name, o):
             return False, f"read-back sha256 {got[:16]} != {o['sha256'][:16]}"
     return True, "sha256 matches"
 
+def _sync_metadata(args, state):
+    """Keep the remote recovery index current, with read-back proof."""
+    _write_manifest(state)
+    for name in ("MANIFEST.jsonl", "archive-state.json"):
+        src = os.path.join(OUT, name)
+        size = os.path.getsize(src)
+        if args.bucket:
+            r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote",
+                          timeout=_transfer_timeout(size))
+        else:
+            r = _rclone(args.remote, "copy", src, args.remote, timeout=600)
+        if r.returncode != 0:
+            log(f"  FAILED metadata upload: {name}"); return False
+        ok, why = _confirm_in_remote(args, name, {"archive_bytes": size, "sha256": sha256(src)})
+        if not ok:
+            log(f"  FAILED metadata read-back: {name}: {why}"); return False
+    log("  remote manifest and recovery index read back with matching hashes")
+    return True
+
+
 def cmd_push(args):
     tool = "wrangler" if args.bucket else "rclone"
     if not shutil.which(tool): log(f"{tool} not found"); return 1
@@ -410,8 +540,8 @@ def cmd_push(args):
         o = state["objects"][name]
         src = os.path.join(OUT, name)
         if not os.path.exists(src):
-            # pushed can now be cleared after the local tarball was removed. pack
-            # runs first and rebuilds it while the transcripts survive; if they
+            # pushed can be cleared after the local tarball was removed. pack
+            # rescues surviving transcripts into a new part; if they
             # are gone too (cleanupPeriodDays), nothing can ever re-send it.
             # Counting that as a failure would stop every later run before
             # verify and prune, so it is reported, not failed.
@@ -420,9 +550,9 @@ def cmd_push(args):
             continue
         size = os.path.getsize(src)
         if args.bucket and size >= WRANGLER_MAX_BYTES:
-            log(f"  push {name}: {size/1e6:.0f} MB is over wrangler's 315 MB object limit -- "
-                f"push it with --remote (rclone) instead"); ok_all = False; continue
-        if args.bucket:
+            log(f"  push {name} -> r2://{args.bucket}/{name} ({size/1e6:.1f} MB; multipart)")
+            r = _r2_multipart(args, src, name)
+        elif args.bucket:
             log(f"  push {name} -> r2://{args.bucket}/{name}  ({size/1e6:.1f} MB)")
             r = _wrangler(args.bucket, "put", f"{args.bucket}/{name}", f"--file={src}", "--remote",
                           timeout=_transfer_timeout(size))
@@ -439,24 +569,30 @@ def cmd_push(args):
             ok_all = False; continue
         log(f"    confirmed in remote ({why})")
         o["pushed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        o.setdefault("first_pushed", o["pushed"])
         save_state(state)
-    for f in ("MANIFEST.jsonl", "archive-state.json"):
-        src = os.path.join(OUT, f)
-        if args.bucket: _wrangler(args.bucket, "put", f"{args.bucket}/{f}", f"--file={src}", "--remote",
-                                  timeout=_transfer_timeout(os.path.getsize(src) if os.path.exists(src) else 0))
-        else: _rclone(args.remote, "copy", src, args.remote, timeout=600)
+    if not _sync_metadata(args, state): ok_all = False
     return 0 if ok_all else 1
 
 def cmd_verify(args):
     """Pull each pushed object back down; check sha256, then extract and diff
-    member list + per-file line counts against what is still on local disk."""
+    member list + logical line counts against what is still on local disk.
+    Always recheck prior successes so prune never relies on an old remote."""
     state = load_state()
-    todo = [n for n, o in state["objects"].items() if o.get("pushed") and not o.get("verified")]
-    if not todo: log("  nothing pushed-and-unverified"); return 0
+    todo = [n for n, o in state["objects"].items() if o.get("pushed") and not o.get("rotated")
+            and (not getattr(args, "tree", None) or o.get("tree") in args.tree)]
+    if not todo: log("  nothing pushed in scope"); return 0
     ok_all = True
     for name in sorted(todo):
         o = state["objects"][name]
         log(f"  verify {name}")
+        # Publication history is permanent, unlike fresh deletion permission.
+        # A failed recheck must never rebuild this key from partial survivors.
+        o.setdefault("first_pushed", o["pushed"])
+        # Revoke old permission before any fallible remote operation.
+        o["verified"] = None
+        o.pop("member_sha256", None)
+        save_state(state)
         with tempfile.TemporaryDirectory() as td:
             local, r = _remote_get(args, name, td, o.get("archive_bytes") or 0)
             if r.returncode != 0 or not os.path.exists(local):
@@ -476,18 +612,31 @@ def cmd_verify(args):
                 log(f"    FAILED sha256: {got[:16]} != {o['sha256'][:16]}"); ok_all = False; continue
             log(f"    sha256 ok")
             ex = os.path.join(td, "x"); os.makedirs(ex)
-            d = subprocess.run(["zstd", "-d", "-c", local], capture_output=True)
             tp = os.path.join(td, "a.tar")
-            with open(tp, "wb") as f: f.write(d.stdout)
-            with tarfile.open(tp) as tf: tf.extractall(ex, filter="data")
-            members = sorted(m for m in o["members"])
+            members = sorted(o["members"])
+            try:
+                with open(tp, "wb") as f:
+                    subprocess.run(["zstd", "-q", "-d", "-c", local], stdin=subprocess.DEVNULL,
+                                   stdout=f, stderr=subprocess.PIPE, timeout=1800, check=True)
+                with tarfile.open(tp) as tf:
+                    entries = tf.getmembers()
+                    if sorted(m.name for m in entries) != members or any(not m.isfile() for m in entries):
+                        raise ValueError("archive member list differs from state or includes non-files")
+                    tf.extractall(ex, filter="data")
+            except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as e:
+                log(f"    FAILED restore: {e}"); ok_all = False; continue
+            digests = {}
             bad = 0; checked = 0; lines = 0; changed = 0
             snap = snapshot_epoch(o)
             for rel in members:
                 x = os.path.join(ex, rel)
                 if not os.path.exists(x):
                     log(f"    MISSING in archive: {rel}"); bad += 1; continue
-                lines += count_lines(x)
+                try:
+                    lines += count_lines(x)
+                except OSError as e:
+                    log(f"    FAILED transcript decode: {e}"); bad += 1; continue
+                digests[rel] = sha256(x)
                 loc = os.path.join(HOME, rel)
                 try: m = os.path.getmtime(loc)
                 except OSError: continue
@@ -498,7 +647,7 @@ def cmd_verify(args):
                     # the object intact; byte-comparing would fail forever.
                     changed += 1; continue
                 checked += 1
-                if sha256(x) != sha256(loc):
+                if digests[rel] != sha256(loc):
                     log(f"    CONTENT MISMATCH: {rel}"); bad += 1
             if lines != o["line_count"]:
                 log(f"    LINE COUNT MISMATCH: {lines:,} != {o['line_count']:,}"); bad += 1
@@ -507,51 +656,110 @@ def cmd_verify(args):
             later = f", {changed} written since pack (not compared)" if changed else ""
             log(f"    restored {len(members)} members, {lines:,} lines, "
                 f"{checked} byte-compared against local{later} -- OK")
-            state["objects"][name]["verified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            o["verified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            o["member_sha256"] = digests
             save_state(state)
+    if not _sync_metadata(args, state): ok_all = False
     return 0 if ok_all else 1
 
-def cmd_prune(args):
-    """Delete local transcripts covered by a VERIFIED remote object.
+def codex_archived(path):
+    """Native status is authoritative. Missing, unreadable or unarchived stays.
 
-    --tree scopes it. Claude's own `cleanupPeriodDays` already retires
-    ~/.claude/projects on a 90-day clock, so pruning that tree here would just
-    race a mechanism that already works. Codex has no retention of any kind --
-    oldest session on disk is 2025-09-12 and nothing has ever removed one -- so
-    that is what this is for.
+    Codex keeps a .jsonl rollout_path even after compressing it to .jsonl.zst.
+    Use the newest state schema; never fall back to an older database's status.
+    """
+    databases = []
+    for db in Path(HOME, ".codex").glob("state_*.sqlite"):
+        m = re.fullmatch(r"state_(\d+)\.sqlite", db.name)
+        if m: databases.append((int(m[1]), db))
+    if not databases: return False
+    plain = os.fspath(path).removesuffix(".zst")
+    try:
+        uri = max(databases)[1].absolute().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as con:
+            rows = con.execute("SELECT archived FROM threads WHERE rollout_path IN (?, ?)",
+                               (plain, plain + ".zst")).fetchall()
+        return bool(rows) and all(row[0] == 1 for row in rows)
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _prune_path(tree, rel):
+    if tree not in ("codex-sessions", "codex-archived"): return None
+    root = os.path.join(HOME, ".codex", "sessions" if tree == "codex-sessions" else "archived_sessions")
+    path = os.path.abspath(os.path.join(HOME, rel))
+    resolved_home_path = os.path.join(os.path.realpath(HOME), os.path.relpath(path, HOME))
+    if not path.startswith(root + os.sep) or os.path.realpath(path) != resolved_home_path: return None
+    if not path.endswith((".jsonl", ".jsonl.zst")): return None
+    return path
+
+
+def _unchanged_digest(path, expected):
+    """Check content and detect writes/replacements during the hash read."""
+    before = os.stat(path)
+    if not expected or sha256(path) != expected: return None
+    after = os.stat(path)
+    fields = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    return after if fields(before) == fields(after) else None
+
+
+def cmd_prune(args):
+    """Prune archived Codex chats only after fresh restore verification.
+
+    Claude stays under its client's native retention. Unknown Codex status,
+    an old verification stamp, missing member hashes or changed bytes all keep
+    the local copy. No ingest watermark authorizes deletion.
     """
     state = load_state()
-    ready = {n: o for n, o in state["objects"].items() if o.get("verified")}
-    if args.tree:
-        ready = {n: o for n, o in ready.items() if o.get("tree") in args.tree}
-        log(f"  scoped to tree(s): {', '.join(args.tree)}")
-    if not ready: log("  nothing verified in scope -- refusing to delete anything"); return 0
-    # A file written after its object's snapshot holds lines no verified object
-    # has (a resumed session). Only an object whose snapshot postdates the
-    # file's last write may authorize deleting it.
-    authorized, changed = {}, set()
-    for n, o in ready.items():
-        snap = snapshot_epoch(o)
+    ready = {}
+    for name, o in state["objects"].items():
+        if args.tree and o.get("tree") not in args.tree: continue
+        try:
+            age = time.time() - datetime.fromisoformat(o["verified"]).timestamp()
+        except (KeyError, TypeError, ValueError): continue
+        if 0 <= age <= VERIFY_MAX_AGE_SECONDS and o.get("member_sha256") and not o.get("rotated"):
+            ready[name] = o
+    if not ready:
+        log("  no fresh member verification -- run verify before pruning; nothing deleted")
+        return 0
+    authorized, changed, protected = {}, set(), set()
+    for name, o in ready.items():
         for rel in o["members"]:
-            p = os.path.join(HOME, rel)
-            try: m = os.path.getmtime(p)
-            except OSError: continue
-            if m < snap: authorized[p] = n
-            else: changed.add(p)
+            path = _prune_path(o["tree"], rel)
+            if not path or not os.path.isfile(path): continue
+            if not codex_archived(path):
+                protected.add(path); continue
+            try:
+                digest = o["member_sha256"].get(rel)
+                stat = _unchanged_digest(path, digest)
+                if stat is None or stat.st_mtime >= snapshot_epoch(o):
+                    changed.add(path); continue
+                authorized[path] = (name, digest, stat.st_size)
+            except OSError:
+                changed.add(path)
     changed -= set(authorized)
-    victims = [(n, p, os.path.getsize(p)) for p, n in sorted(authorized.items())]
-    tot = sum(v[2] for v in victims)
-    log(f"  {len(victims):,} local files covered by {len(ready)} VERIFIED objects, {tot/1e9:.2f} GB")
+    total = sum(v[2] for v in authorized.values())
+    log(f"  {len(authorized):,} archived local files covered by fresh VERIFIED objects, {total/1e9:.2f} GB")
+    log(f"  {len(protected):,} unarchived or unknown chats protected")
     if changed:
-        log(f"  {len(changed):,} file(s) written after they were packed -- kept until a "
-            f"later part holding the new lines is verified")
+        log(f"  {len(changed):,} changed files or files written after they were packed -- kept")
     if not args.yes:
-        log("  dry run. re-run with --yes to delete."); return 0
-    removed = 0
-    for _, p, _ in victims:
-        try: os.remove(p); removed += 1
-        except OSError as e: log(f"    could not remove {p}: {e}")
-    log(f"  removed {removed:,} files, {tot/1e9:.2f} GB reclaimed")
+        log("  dry run. re-run with --yes within one hour of verify to delete."); return 0
+    removed = freed = 0
+    for path, (name, digest, _) in sorted(authorized.items()):
+        try:
+            age = time.time() - datetime.fromisoformat(ready[name]["verified"]).timestamp()
+            stat = _unchanged_digest(path, digest)
+            # Recheck status after hashing, immediately before unlinking.
+            if stat is None or not 0 <= age <= VERIFY_MAX_AGE_SECONDS or not codex_archived(path):
+                continue
+            if os.stat(path) != stat: continue
+            os.remove(path)
+            removed += 1
+            freed += stat.st_size
+        except OSError as e:
+            log(f"    could not remove {path}: {e}")
+    log(f"  removed {removed:,} files, {freed/1e9:.2f} GB file bytes (measure df for disk recovery)")
     return 0
 
 def cmd_rotate(args):
@@ -611,9 +819,9 @@ def main():
     ap.add_argument("--remote", default=os.environ.get("SESSION_ARCHIVE_REMOTE", ""))
     ap.add_argument("--bucket", default=os.environ.get("SESSION_ARCHIVE_BUCKET", ""),
                     help="R2 bucket name; uses wrangler instead of rclone "
-                         "(objects must be under 315 MB)")
+                         "(large objects use rclone multipart)")
     ap.add_argument("--tree", action="append",
-                    help="prune only: restrict to a tree "
+                    help="verify/prune only: restrict to a tree "
                          "(claude | codex-sessions | codex-archived); repeatable")
     ap.add_argument("--keep-months", type=int, default=12,
                     help="rotate only: months of cold archive to retain")

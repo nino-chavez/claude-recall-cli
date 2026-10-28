@@ -173,6 +173,24 @@ Review and trust newly added hooks through Codex's `/hooks` interface. A practic
 
 Run `python3 poe-extract.py retention-report --grace-days 7` before any transcript cleanup. The report separates covered, recent, uncovered, and changed files. It always returns `deletion_authorized: false`; a watermark proves that bytes were ingested, not that the session's durable lessons were promoted.
 
+### Cold transcript backups
+
+`session-archive.py` backs up both `.jsonl` and Codex `.jsonl.zst` transcripts.
+Compressed members keep their original bytes; timestamps and line counts come from the decoded JSONL.
+Cold Codex files can enter a monthly part while recent chats wait.
+
+Run `pack`, then `push --bucket <bucket>` and `verify --bucket <bucket>`.
+Large R2 uploads use rclone multipart; install both `zstd` and `rclone` alongside Wrangler.
+Verification downloads every pushed object in scope, restores its members, checks hashes and line counts,
+and uploads the recovery index with a matching read-back hash.
+A failed check revokes that object's earlier verification.
+
+Run `prune --tree codex-archived` to preview cleanup, then add `--yes` to apply it.
+Pruning requires verification within the past hour, matching member hashes, and an archived row in Codex's current state database.
+It rechecks the file and chat status before deleting.
+Unarchived chats, unknown status, changed files, and Claude transcripts stay local.
+Claude continues to use its own retention setting.
+
 ## Automatic scanning (session-end hook)
 
 By default, scanning is manual. To automatically scan for recall-worthy sessions every time a Claude Code session ends, add a `SessionEnd` hook to your global settings (`~/.claude/settings.json`):
