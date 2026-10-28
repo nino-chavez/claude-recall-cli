@@ -231,9 +231,13 @@ def plan_pack(groups, objects, now, cutoff_days, lead_days,
         rebuild = sorted(n for n, o in mine.items()
                          if not any(o.get(k) for k in ("verified", "pushed", "first_pushed"))
                          and not local_exists(n))
+        # A confirmed-missing published object must not be overwritten from
+        # partial survivors. Rescue those survivors into a new part instead.
+        missing = {n for n, o in mine.items() if o.get("first_pushed")
+                   and not o.get("pushed") and not local_exists(n)}
         covered = {}
         for n, o in mine.items():
-            if n in rebuild: continue
+            if n in rebuild or n in missing: continue
             snap = snapshot_epoch(o)
             for rel in o.get("members", []):
                 covered[rel] = max(covered.get(rel, 0.0), snap)
@@ -536,8 +540,8 @@ def cmd_push(args):
         o = state["objects"][name]
         src = os.path.join(OUT, name)
         if not os.path.exists(src):
-            # pushed can now be cleared after the local tarball was removed. pack
-            # runs first and rebuilds it while the transcripts survive; if they
+            # pushed can be cleared after the local tarball was removed. pack
+            # rescues surviving transcripts into a new part; if they
             # are gone too (cleanupPeriodDays), nothing can ever re-send it.
             # Counting that as a failure would stop every later run before
             # verify and prune, so it is reported, not failed.

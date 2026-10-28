@@ -349,12 +349,15 @@ class SplitPackPlanner(unittest.TestCase):
         self.assertEqual(got, {"claude/2026-07.tar.zst": sorted(p for p, _ in f[:2]),
                                "claude/2026-07.part2.tar.zst": [f[2][0]]})
 
-    def test_previously_pushed_archive_is_never_rebuilt_from_survivors(self):
+    def test_missing_published_archive_rescues_survivors_under_a_new_key(self):
         files = self.files(80, 70)
         obj = self.obj(files, 60, verified=False)
         obj.update(pushed=None, first_pushed="2026-01-01T00:00:00+00:00")
-        self.assertEqual(self.plan({("claude", "2026-07"): files[:1]},
-                                   {"claude/2026-07.tar.zst": obj}, exists=False), [])
+        [item] = self.plan({("claude", "2026-07"): files[:1]},
+                          {"claude/2026-07.tar.zst": obj}, exists=False)
+        self.assertEqual(item["name"], "claude/2026-07.part2.tar.zst")
+        self.assertEqual(item["paths"], [files[0][0]])
+        self.assertEqual(len(obj["members"]), 2)
 
     def test_part_names(self):
         self.assertEqual(sa.obj_name("claude", "2026-07", 3), "claude/2026-07.part3.tar.zst")
