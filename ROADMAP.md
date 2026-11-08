@@ -2,6 +2,82 @@
 
 Paused 2026-03-24. Resume ~2026-06-24 with 3 months of accumulated session data.
 
+## Bounded run-diagnostic pilot — 2026-11-08
+
+**No configuration change is justified by this pilot. The cross-harness result
+is inconclusive because the proposed Claude sample consisted of automatic
+commit reviews.** The existing `recall-scan.py:is_machine_authored` filter
+already rejects that opening-prompt pattern. This was a sampling error in the
+investigation, not a missing filter to implement.
+
+The question came from Ben Holmes's
+[agent self-improvement talk](https://www.youtube.com/watch?v=pz74r-4dGfQ): can
+tool-call evidence from completed runs reveal a recurring, preventable problem
+that merits a small skill or configuration change? The initial investigation
+had a 30-minute ceiling, eight discovery runs, and at most two reserved cases.
+A patch required the same cause in independent runs, a missing or wrong
+instruction or implementation still present at its owner, and a meaningful
+before/after check. No score, prose grading, new miner, or scheduled job was
+introduced. The July calibration decision below remains closed.
+
+Scope was retained local runs in Nino-owned `tools/`, `methods/`, and
+`platform/operator`, initially November 1–7, widened only to October 20.
+Employer/client work, brand-generation work, the active investigation, native
+subagents, and background housekeeping were excluded. Discovery used existing
+Poe source-identity helpers and inspected tool events; those helpers do not
+replace the nomination filter or supply a full tool-result parser.
+
+### Sample disposition
+
+These are source identifiers, not transcript excerpts. Dates and diagnostic
+line numbers refer to retained local transcripts. Completion events establish
+that a worker turn ended, not that its output was correct.
+
+| Role and disposition | Session ID | Project and date |
+|---|---|---|
+| Claude automatic review — excluded | `f291055c-d95b-4cce-b349-c8f6beecab10` | Operator, November 2 |
+| Claude automatic review — excluded | `4f5f36fa-4ab8-409c-b3d1-ed792c046041` | Blueprint, November 7 |
+| Claude automatic review — excluded | `f9dc00c5-96d0-4c65-a186-71f398f19eed` | Agentic Field Kit, November 7 |
+| Claude automatic review — excluded | `8a1ae9aa-bbac-40cd-bc5d-0512ef377ae8` | browse-tool, October 31 |
+| Codex CLI worker — retained | `01a19d86-d12e-7120-b1f0-8e86929b036d` | Operator publisher, November 2 |
+| Codex CLI worker — retained | `01a19d86-d14d-7ac1-9453-918e97ba4ec0` | Operator reader, November 2 |
+| Codex CLI worker — retained | `01a19d00-700a-7bc2-97e7-90c12e8ddcbd` | music-librarian, November 2 |
+| Codex CLI worker — retained | `01a1a37a-e7d3-7b22-beea-c140cbb28ac7` | browse-tool, November 3 |
+
+The two Operator workers contributed to the same change, merged as Operator
+PR #33 (`91bb62c`); they are not independent task replicates. The parent checked
+the existing machine-authored filter and actual event dates after discovering
+the Claude selection error. No replacement Claude implementation run qualified
+in the scoped retained files. File modification dates alone were misleading:
+some recently modified files contained older events. Neither reserved case was
+used for a before/after test because no patch qualified.
+
+### Findings checked against current owners
+
+- **Operator reader:** a missing plugin SDK module at transcript line 62,
+  `2026-11-02T18:32:08Z`, preceded completion at line 240. The initial report
+  suggested a possible bootstrap-documentation gap, but the parent found the
+  install/test/build sequence already in `platform/operator/docs/work-dashboard.md`
+  under “Install and open” (lines 95–98 at `91bb62c`). The missing-module event
+  does not establish a missing instruction or a recurring root cause.
+- **browse-tool:** the November 3 worker attempted the nonexistent `browse-tool`
+  command (line 35) and could not load `playwright` (lines 41 and 46), then ended
+  at line 59. At `1357ada`, `package.json` declares the `browse-*` commands and
+  `puppeteer-core`, not Playwright; the README documents installation, PATH,
+  and the individual commands. These events do not justify another setup rule.
+- **Operator publisher:** `python` was unavailable at line 78,
+  `2026-11-02T18:34:18Z`; the worker ended at line 337. Operator's development
+  instructions already use `python3` (`README.md:163` at `91bb62c`). No wrong
+  owning instruction was established.
+
+The parent verified those event diagnostics and source locations independently
+of the discovery report. No recurring cause cleared the patch threshold in the
+retained Codex slice. That limited finding is not a clean bill of health for
+either harness, a performance comparison, or evidence that the proposed
+self-improvement loop cannot help. No behavioral patch or improvement claim was
+made. A future experiment needs an eligible sample before diagnostic review;
+this pilot does not authorize more sampling or automatic calibration.
+
 ## Resume run executed 2026-07-02
 
 `extract --days 90` + `correlate` on n=838 sessions (pass rate 0.498, followup-fix rate 0.142). Followup-fix predictors, sorted:
