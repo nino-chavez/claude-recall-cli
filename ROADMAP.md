@@ -2,6 +2,134 @@
 
 Paused 2026-03-24. Resume ~2026-06-24 with 3 months of accumulated session data.
 
+## Implementation-session rerun — 2026-11-08
+
+**The rerun found a specific instruction gap: reuse a worktree already assigned
+by the session host before creating another checkout.** Three Claude
+implementation episodes hit the same host isolation denial. All 11 rejected
+edits later succeeded with identical replacement text and file-relative paths
+in the assigned worktree. The four Codex episodes exposed other recoveries, but
+no second recurring cause justified a configuration change.
+
+The operator authorized this rerun and a wider date window after the first
+pilot's invalid Claude sample. The investigation had a 45-minute ceiling. It
+retained the earlier repository scope and exclusions, required actual code edits
+and an ended implementation episode, and selected on eligibility rather than
+failure or test success. The July calibration decision remains closed.
+
+### Accepted implementation episodes
+
+Source references below are session IDs and physical JSONL line numbers, not
+transcript excerpts. Claude sources are under `~/.claude/projects/`; Codex
+sources are under `~/.codex/sessions/` or `~/.codex/archived_sessions/`, including
+`.jsonl.zst`. Dates are event dates in UTC. A worker's closing event establishes
+its handoff, not the correctness or release of its output.
+
+| Case | Session ID | UTC date and implementation | Assignment; code edit → result; end |
+|---|---|---|---|
+| C1 | `c11f19f7-cbe2-4d68-bc1e-98d01948e574` | Sep 25, Blueprint global-rules hook outcome | 9; 248 → 250; 809 |
+| C2 | `2778421c-a489-45ef-955c-36b221e5101f` | Sep 25, Blueprint npm CLI fallback | 10; 235 → 238; 960 |
+| C3 | `18ab1b0b-6739-45a3-aa1a-0ad75c4761ee` | Sep 25, Blueprint state-derive/global-rules paths | 9; 371 → 378; 1491 |
+| C4 | `67e145da-2511-495c-9bca-b4c13ea7679e` | Sep 25, Blueprint allowlist inline comments | 9; 219 → 220; 803 |
+| X1 | `01a1931e-43a8-7191-9eda-397ff99f39bc` | Oct 31, browse-tool background tabs | 9; 112 → 114; 315 |
+| X2 | `01a19256-6447-75c3-b8b3-17d3d055af62` | Oct 31, browse-tool connection targets | 9; 97 → 99; 213 |
+| X3 | `01a18536-6dcb-76b3-b22d-fa651fd41618` | Oct 29, Operator backup retention | 9; 89 → 91; 237 |
+| X4 | `01a17455-330d-7402-a3f8-55ab6f1a44c2` | Oct 25, browse-tool capture metadata | 509; 583 → 588; 819 |
+
+The review ranges run from each assignment through its end. X4 is restricted
+to lines 509–819; later blog changes in that chat are excluded. X1–X3 are CLI
+implementation workers, and X4 is a parent implementation episode. Their
+parents/reviewers are not additional cases. X3 explicitly handed off uncommitted
+work. Claude's four cases are separate fixes within one coordinated Blueprint
+batch, with three touching the same hook. They are correlated observations,
+not four independent fleet samples. The different dates, tasks and harness
+roles prevent a meaningful performance ranking.
+
+The parent independently verified assignment/edit/result/end records. Later
+merge receipts confirm Blueprint PRs
+[#58](https://github.com/nino-chavez/blueprint/pull/58),
+[#50](https://github.com/nino-chavez/blueprint/pull/50),
+[#52](https://github.com/nino-chavez/blueprint/pull/52), and
+[#53](https://github.com/nino-chavez/blueprint/pull/53), and browse-tool PRs
+[#7](https://github.com/nino-chavez/browse-tool/pull/7),
+[#6](https://github.com/nino-chavez/browse-tool/pull/6), and
+[#5](https://github.com/nino-chavez/browse-tool/pull/5). These receipts are
+separate from the worker-turn completion evidence.
+
+### Repeated worktree mismatch and paired recovery
+
+The desktop host assigned a checkout under `.claude/worktrees/`, while the
+sessions created additional `.worktrees/fix/...` checkouts. The host's Edit
+guard rejected the extra locations. Each denied request has a later successful
+request with the same relative file, `old_string`, `new_string`, and
+`replace_all`; the checkout path changed. This comparison uses actual call IDs
+and tool results, without treating an agent's success summary as proof.
+
+| Case | Rejected edit call → result | Same edit succeeded, call → result |
+|---|---|---|
+| C2 | 213 → 214; 215 → 216; 217 → 218; 219 → 220 | 235 → 238; 236 → 239; 237 → 241; 240 → 242 |
+| C3 | 315 → 316; 317 → 318; 319 → 320; 321 → 322; 323 → 324; 325 → 331 | 359 → 360; 361 → 363; 362 → 367; 366 → 368; 369 → 370; 371 → 378 |
+| C4 | 173 → 174 | 198 → 200 |
+
+The current owner still prescribed creating a worktree as a fresh session's
+first action: dotfiles `ways-of-working/worktrees.md:18` and
+`ways-of-working/working-style.md:257–262` at `e822c02`. The selected clarification
+replaces that unconditional start with an assigned-worktree check, retains
+`.worktrees/<branch>` for newly created checkouts, and leaves the current
+host-managed worktree's cleanup to its host. Both the short rule and its full
+owner change together. No isolation guard is relaxed.
+
+This is a retrospective before/after recovery check. It supports the path
+correction and a narrow instruction clarification. It does not measure whether
+the new wording changes future model behavior, time, cost, or failure rates.
+C1 had no matching isolation denial. Its nonzero shell result at 549/550 came
+from inspection output and a command chain; that alone did not qualify as a
+process defect. C3's expected doctor-output differences and a redundant-read
+guard denial also did not justify new rules.
+
+### Other recoveries and rejected changes
+
+- **X1:** npm returned HTTP 403 at 53/54. The worker located installed Puppeteer
+  source at 60/61 and used it at 65/66. Its final at 313 did not mention that
+  registry error. The trace proves a failed request, not its underlying network
+  cause or a missing setup instruction.
+- **X2:** the worktree lacked the queried dependency directory at 26/27. The
+  worker linked existing dependencies at 62/63 and later removed that link.
+  The final at 211 disclosed sandbox limits on the full test suite. The current
+  browse-tool README already documents installation at lines 98–103,
+  commit `1357ada`. A missing local dependency and X1's HTTP rejection do not
+  establish the same root cause, so no bootstrap rule was added.
+- **X3:** failures at 80/81 and 122/123 were intermediate tests for the feature
+  under implementation. The new module/integration followed at 89/91 and 128.
+  They were excluded from process-error findings; no candidate was retained.
+- **X4:** PR creation omitted the required `repository_full_name` field at
+  667/670. The corrected call at 672/677 opened PR #5. The final at 816 omitted
+  the schema retry. One recovered API-shape error did not establish recurrence.
+
+The recoveries omitted from two final summaries show why full tool traces can
+add diagnostic information. Omission of incidental errors does not establish
+intentional concealment, and these observations do not validate model-generated
+quality scores or an unattended self-improvement loop.
+
+### Collection and review limits
+
+The date search reached September 25 for Claude and October 25 for Codex.
+Automatic reviews, native subagents, prose-only work and unrelated projects
+remained excluded. A nominally machine-authored opening is only a screening cue:
+the existing nomination filter also matches continued conversations, which can
+contain genuine implementation work.
+
+The initial Codex eligibility search was incomplete because
+`poe-extract.py:_iter_session_files` enumerates plain `.jsonl` files. The parent
+found 1,974 compressed files under `sessions/` and 430 under `archived_sessions/`
+in the local snapshot, then used the existing
+`session-archive.py:transcript_lines` decoder. This is a sampling-route correction;
+it does not prove Poe missed prior ingestion. No parser or scheduled job was
+added. Two bounded helpers timed out without final reports. The parent recovered
+candidate locations from their retained tool results and verified the accepted
+source records and Claude finding directly. The completed Codex diagnostic
+report was also checked against the cited tool results and current owner.
+
 ## Bounded run-diagnostic pilot — 2026-11-08
 
 **No configuration change is justified by this pilot. The cross-harness result
