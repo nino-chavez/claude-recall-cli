@@ -31,6 +31,9 @@
         "list_memory_candidates",
         "get_memory",
         "set_memory_status",
+        "report_memory_outcome",
+        "link_memories",
+        "unlink_memories",
         "get_ingest_receipt"
       ],
       "timeout": 45000,

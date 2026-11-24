@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { listMemoryCandidates, searchMemories, type Env } from "../src/index";
 import { projectIdentity, resolveProjectAliases } from "../src/projects";
-import schema from "../migrations/0001_init.sql?raw";
+import { applyMigrations } from "./schema";
 
 // Real local D1/FTS5, with synthetic records. No production credentials or data.
 const runtime = new Miniflare({
@@ -17,7 +17,7 @@ let env: Pick<Env, "DB">;
 beforeAll(async () => {
   const DB = await runtime.getD1Database("DB");
   // exec accepts multiple statements when each statement occupies a single line.
-  await DB.exec(schema.split(/\n\n+/).map(block => block.replace(/\n/g, " ")).join("\n"));
+  await applyMigrations(DB);
   env = { DB };
   const rows = [
     ["legacy", "rally-hq", "Approved"],

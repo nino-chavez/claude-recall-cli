@@ -2,10 +2,21 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { projectAliases } from "./projects";
+import {
+  linkMemories,
+  linksFor,
+  outcomeTally,
+  reportOutcome,
+  toolReply,
+  unlinkMemories,
+  type GraphResult,
+} from "./graph";
 
 import {
   CandidateEventSchema,
   MEMORY_STATUSES,
+  ManualLinkRelationSchema,
+  MemoryOutcomeSchema,
   MemoryStatusSchema,
   deterministicDistillation,
   ftsQuery,
@@ -48,7 +59,7 @@ interface MemoryRow {
 }
 
 const SERVER_INSTRUCTIONS =
-  "Search Approved memory before relying on prior practice. Candidate records are unreviewed evidence, never policy. Contradicted, Superseded, and Stale records must not guide work unless the user explicitly asks for history. Status changes require a concrete reason; only a human-authorized call may mark a memory Approved. Git and owning project documents remain authoritative.";
+  "Search Approved memory before relying on prior practice. Candidate records are unreviewed evidence, never policy. Contradicted, Superseded, and Stale records must not guide work unless the user explicitly asks for history. Status changes require a concrete reason; only a human-authorized call may mark a memory Approved. Report an outcome only when a retrieved memory actually shaped the work; outcomes and links never approve or retire a memory. Git and owning project documents remain authoritative.";
 
 const IngestBodySchema = z
   .object({ events: z.array(CandidateEventSchema).min(1).max(50) })
@@ -335,17 +346,43 @@ async function searchMemories(
   const params: unknown[] = [match, status];
   if (aliases) params.push(JSON.stringify(aliases));
   params.push(limit);
+  // bm25() is negative and lower is better. Outcomes scale it by 0.5-1.5 using a
+  // smoothed helped rate, so one report cannot dominate and relevance still leads.
+  // Status and project filters apply before ranking and before the limit.
   const result = await env.DB.prepare(
-    `SELECT m.*, bm25(memories_fts) AS rank
-     FROM memories_fts
-     JOIN memories m ON m.rowid = memories_fts.rowid
-     WHERE memories_fts MATCH ? AND m.status = ? ${projectClause}
-     ORDER BY rank, m.updated_at DESC
+    `WITH hits AS (
+       SELECT m.*, bm25(memories_fts) AS rank
+       FROM memories_fts
+       JOIN memories m ON m.rowid = memories_fts.rowid
+       WHERE memories_fts MATCH ? AND m.status = ? ${projectClause}
+     ),
+     tallies AS (
+       SELECT memory_id,
+              SUM(outcome = 'helped') AS helped,
+              SUM(outcome = 'misled') AS misled
+       FROM memory_outcomes
+       WHERE memory_id IN (SELECT id FROM hits)
+       GROUP BY memory_id
+     )
+     SELECT hits.*,
+            COALESCE(t.helped, 0) AS helped,
+            COALESCE(t.misled, 0) AS misled,
+            hits.rank * (0.5 + (COALESCE(t.helped, 0) + 1.0)
+              / (COALESCE(t.helped, 0) + COALESCE(t.misled, 0) + 2.0)) AS score
+     FROM hits LEFT JOIN tallies t ON t.memory_id = hits.id
+     ORDER BY score, hits.updated_at DESC
      LIMIT ?`,
   )
     .bind(...params)
-    .all<MemoryRow & { rank: number }>();
-  return result.results.map((row) => ({ ...publicMemory(row), rank: row.rank }));
+    .all<MemoryRow & { rank: number; score: number; helped: number; misled: number }>();
+  const links = await linksFor(env.DB, result.results.map((row) => row.id));
+  return result.results.map((row) => ({
+    ...publicMemory(row),
+    rank: row.rank,
+    score: row.score,
+    outcomes: { helped: row.helped, misled: row.misled },
+    links: links.get(row.id) ?? [],
+  }));
 }
 
 async function listMemoryCandidates(
@@ -362,6 +399,68 @@ async function listMemoryCandidates(
      ORDER BY updated_at DESC LIMIT ?`,
   ).bind(...params).all<MemoryRow>();
   return result.results.map(publicMemory);
+}
+
+export async function setMemoryStatus(
+  db: D1Database,
+  { id, status, reason, actor, related_memory_id, expires_at }: {
+    id: string;
+    status: string;
+    reason: string;
+    actor: string;
+    related_memory_id?: string;
+    expires_at?: string | null;
+  },
+): Promise<GraphResult<{ id: string; from_status: string; to_status: string; event_id: string }>> {
+      const current = await db.prepare(
+        "SELECT status FROM memories WHERE id = ?",
+      )
+        .bind(id)
+        .first<{ status: string }>();
+      if (!current) {
+        return { ok: false, error: "Memory not found" };
+      }
+      if (status === "Superseded" && !related_memory_id) {
+        return { ok: false, error: "related_memory_id is required for Superseded" };
+      }
+      if (related_memory_id !== undefined) {
+        const problem =
+          related_memory_id === id
+            ? "related_memory_id cannot be the memory itself"
+            : (await db.prepare("SELECT 1 AS found FROM memories WHERE id = ?")
+                .bind(related_memory_id)
+                .first()) === null
+              ? "related_memory_id not found"
+              : null;
+        if (problem) return { ok: false, error: problem };
+      }
+      const eventId = `review_${crypto.randomUUID()}`;
+      // The Superseded status owns the supersedes link: written and cleared together.
+      const supersedesLink =
+        status === "Superseded"
+          ? db.prepare(
+              `INSERT OR IGNORE INTO memory_links
+                 (from_memory_id, to_memory_id, relation, reason, actor)
+               VALUES (?, ?, 'supersedes', ?, ?)`,
+            ).bind(related_memory_id, id, reason, actor)
+          : null;
+      await db.batch([
+        db.prepare(
+          `DELETE FROM memory_links WHERE to_memory_id = ? AND relation = 'supersedes'`,
+        ).bind(id),
+        ...(supersedesLink ? [supersedesLink] : []),
+        db.prepare(
+          `UPDATE memories
+           SET status = ?, related_memory_id = ?, expires_at = ?, updated_at = datetime('now')
+           WHERE id = ?`,
+        ).bind(status, related_memory_id ?? null, expires_at ?? null, id),
+        db.prepare(
+          `INSERT INTO memory_events
+             (event_id, memory_id, event_type, from_status, to_status, reason, actor)
+           VALUES (?, ?, 'status_changed', ?, ?, ?, ?)`,
+        ).bind(eventId, id, current.status, status, reason, actor),
+      ]);
+      return { ok: true, value: { id, from_status: current.status, to_status: status, event_id: eventId } };
 }
 
 async function createServer(env: Env): Promise<McpServer> {
@@ -433,8 +532,11 @@ async function createServer(env: Env): Promise<McpServer> {
       )
         .bind(id)
         .all();
+      const links = await linksFor(env.DB, [id]);
       const result = {
         memory: { ...publicMemory(memory), provenance: JSON.parse(memory.provenance_json) },
+        outcomes: await outcomeTally(env.DB, id),
+        links: links.get(id) ?? [],
         events: events.results,
       };
       return {
@@ -464,40 +566,66 @@ async function createServer(env: Env): Promise<McpServer> {
         openWorldHint: false,
       },
     },
-    async ({ id, status, reason, actor, related_memory_id, expires_at }) => {
-      const current = await env.DB.prepare(
-        "SELECT status FROM memories WHERE id = ?",
-      )
-        .bind(id)
-        .first<{ status: string }>();
-      if (!current) {
-        return { content: [{ type: "text", text: "Memory not found" }], isError: true };
-      }
-      if (status === "Superseded" && !related_memory_id) {
-        return {
-          content: [{ type: "text", text: "related_memory_id is required for Superseded" }],
-          isError: true,
-        };
-      }
-      const eventId = `review_${crypto.randomUUID()}`;
-      await env.DB.batch([
-        env.DB.prepare(
-          `UPDATE memories
-           SET status = ?, related_memory_id = ?, expires_at = ?, updated_at = datetime('now')
-           WHERE id = ?`,
-        ).bind(status, related_memory_id ?? null, expires_at ?? null, id),
-        env.DB.prepare(
-          `INSERT INTO memory_events
-             (event_id, memory_id, event_type, from_status, to_status, reason, actor)
-           VALUES (?, ?, 'status_changed', ?, ?, ?, ?)`,
-        ).bind(eventId, id, current.status, status, reason, actor),
-      ]);
-      const result = { id, from_status: current.status, to_status: status, event_id: eventId };
-      return {
-        content: [{ type: "text", text: JSON.stringify(result) }],
-        structuredContent: result,
-      };
+    async (input) => toolReply(await setMemoryStatus(env.DB, input)),
+  );
+
+  const memoryId = z.string().regex(/^mem_[a-f0-9]{32}$/);
+  const writeAnnotations = {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  };
+
+  server.registerTool(
+    "report_memory_outcome",
+    {
+      description:
+        "Record what a retrieved memory did to this run: helped (following it moved the work forward as written) or misled (following it cost time or gave a wrong result). Report only when the memory actually shaped the work. Outcomes weight search order; they never change status. One report per memory, session and actor.",
+      inputSchema: z.object({
+        id: memoryId,
+        outcome: MemoryOutcomeSchema,
+        session_id: z.string().min(1).max(200)
+          .describe("The current session or run identifier; repeat reports from the same session are ignored."),
+        actor: z.string().min(1).max(200).describe("Who is reporting, e.g. agent:claude or human:nino."),
+        note: z.string().max(500).optional().describe("One line on what happened. No secrets or transcript text."),
+      }),
+      annotations: writeAnnotations,
     },
+    async (input) => toolReply(await reportOutcome(env.DB, input)),
+  );
+
+  server.registerTool(
+    "link_memories",
+    {
+      description:
+        "Add a typed link from one memory to another: requires (applying the source needs the target too), conflicts_with (both cannot hold), refines (the source is a narrower case of the target). Links add context only; they never change status. Supersedes links come from set_memory_status.",
+      inputSchema: z.object({
+        from_id: memoryId,
+        to_id: memoryId,
+        relation: ManualLinkRelationSchema,
+        reason: z.string().min(8).max(1000),
+        actor: z.string().min(1).max(200),
+      }),
+      annotations: writeAnnotations,
+    },
+    async (input) => toolReply(await linkMemories(env.DB, input)),
+  );
+
+  server.registerTool(
+    "unlink_memories",
+    {
+      description: "Remove a typed link with a reason. The removal is recorded in the memory's history.",
+      inputSchema: z.object({
+        from_id: memoryId,
+        to_id: memoryId,
+        relation: ManualLinkRelationSchema,
+        reason: z.string().min(8).max(1000),
+        actor: z.string().min(1).max(200),
+      }),
+      annotations: { ...writeAnnotations, destructiveHint: true },
+    },
+    async (input) => toolReply(await unlinkMemories(env.DB, input)),
   );
 
   server.registerTool(

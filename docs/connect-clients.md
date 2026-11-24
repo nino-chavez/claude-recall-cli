@@ -114,3 +114,4 @@ For each harness, use its MCP status command and then run these checks:
 3. `set_memory_status` asks for approval and rejects a missing reason.
 4. A search for a Contradicted, Superseded, or Stale item returns nothing unless that status is requested explicitly.
 5. `get_memory` shows source provenance and the status-change event trail.
+6. `report_memory_outcome`, `link_memories` and `unlink_memories` are listed, and calling one does not change the memory's status.
