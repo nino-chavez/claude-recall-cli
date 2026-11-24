@@ -10,6 +10,21 @@ export const MEMORY_STATUSES = [
 
 export const MemoryStatusSchema = z.enum(MEMORY_STATUSES);
 
+// One axis: what using the memory did to the run that retrieved it.
+//   helped: following it moved the work forward as written.
+//   misled: following it cost time or produced a wrong result.
+export const MEMORY_OUTCOMES = ["helped", "misled"] as const;
+export const MemoryOutcomeSchema = z.enum(MEMORY_OUTCOMES);
+
+// One axis: how the source memory stands toward the target memory.
+//   supersedes:     the source replaces the target (written only by set_memory_status).
+//   requires:       applying the source needs the target applied too.
+//   conflicts_with: the source and the target cannot both hold.
+//   refines:        the source is a narrower, more specific case of the target.
+export const LINK_RELATIONS = ["supersedes", "requires", "conflicts_with", "refines"] as const;
+export const LinkRelationSchema = z.enum(LINK_RELATIONS);
+export const ManualLinkRelationSchema = z.enum(["requires", "conflicts_with", "refines"]);
+
 const CREDENTIAL_PATTERN =
   /(?:sk-ant-api\d{2}-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,}|cfk_[A-Za-z0-9_-]{24,}|sbp_[A-Za-z0-9]{20,}|sb(?:p|s)_[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|ey[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/;
 
@@ -51,6 +66,10 @@ export const CandidateEventSchema = z
       });
     }
   });
+
+export function containsCredential(value: string): boolean {
+  return CREDENTIAL_PATTERN.test(value);
+}
 
 export type CandidateEvent = z.infer<typeof CandidateEventSchema>;
 export type MemoryStatus = z.infer<typeof MemoryStatusSchema>;

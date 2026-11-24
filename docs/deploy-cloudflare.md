@@ -113,6 +113,7 @@ Normalization can change `title`, `body`, `kind`, and `confidence`. It cannot ch
 - Raw transcripts remain local and follow the local watermark plus archive-grace policy.
 - Migration `0002_remove_raw_provenance.sql` removes the prototype's old `evidence_excerpt` field and writes a non-content audit event. On an existing deployment, record a recovery bookmark and obtain approval before applying that destructive redaction remotely.
 - Migration `0003_keep_voice_signals_local.sql` replaces older cloud voice-signal content with a local-only marker and writes a non-content audit event. Record a recovery bookmark and obtain approval before applying it remotely.
+- Migration `0004_outcomes_and_links.sql` is additive. It creates `memory_outcomes` and `memory_links` and backfills `supersedes` links from existing Superseded records. Apply it remotely before deploying the Worker version that reads those tables, because search fails without them. Record a recovery bookmark first.
 - Rehearse Time Travel against a separate remote D1 database built from the same schema. Cloudflare restores a database in place and does not currently clone a production bookmark into another database, so the rehearsal proves the restore mechanism without touching live data.
 
 ### Time Travel rehearsal

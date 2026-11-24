@@ -57,6 +57,30 @@ records a processed receipt.
 
 Ingestion can only create `Candidate`. AI normalization can shorten or clean a candidate, but it cannot set status. The MCP write tool requires a reason, and `Superseded` also requires the replacement memory ID.
 
+## Outcomes and links
+
+Neither of these changes a memory's state. Approval stays a human status change.
+
+**Outcomes** record what a retrieved memory did to the run that used it. `report_memory_outcome` takes one of two values:
+
+| Outcome | Test sentence |
+|---|---|
+| `helped` | Following it moved the work forward as written. |
+| `misled` | Following it cost time or produced a wrong result. |
+
+One report counts per memory, session and actor. Search multiplies the BM25 relevance score by `0.5 + (helped + 1) / (helped + misled + 2)`, so the factor stays between 0.5 and 1.5. A memory with no reports keeps a factor of 1. One report moves it only slightly, and a much more relevant match still ranks first. The status and project filters apply before ranking and before the result limit. Each result returns its `outcomes` counts and the combined `score`, so the order can be checked.
+
+**Links** connect two memories with one typed relation, read from source to target:
+
+| Relation | Test sentence | Written by |
+|---|---|---|
+| `supersedes` | The source replaces the target. | `set_memory_status` only, with `Superseded` |
+| `requires` | Applying the source needs the target applied too. | `link_memories` |
+| `conflicts_with` | The source and the target cannot both hold. | `link_memories` |
+| `refines` | The source is a narrower, more specific case of the target. | `link_memories` |
+
+`search_memory` and `get_memory` return each memory's links in both directions, with the other memory's title and status. A link to a `Stale` or `Contradicted` memory is still shown, so its state stays visible. Adding or removing a link writes an event to the memory's history. The `supersedes` link follows the status: setting `Superseded` writes it, and any later status change clears it.
+
 ## Project matching
 
 `search_memory` and `list_memory_candidates` resolve project aliases before
